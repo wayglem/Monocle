@@ -5,7 +5,11 @@ from asyncio import get_event_loop
 
 from aiohttp import ClientSession
 
+from .utils import load_accounts
+
+
 LOOP = get_event_loop()
+ACCOUNTS = load_accounts()
 
 
 class SessionManager:

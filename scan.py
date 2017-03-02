@@ -22,10 +22,10 @@ from os.path import exists, join
 from sys import platform
 from concurrent.futures import TimeoutError
 
+import time
+
 from sqlalchemy.exc import DBAPIError
 from aiopogo import close_sessions
-
-import time
 
 # Check whether config has all necessary attributes
 _required = (
@@ -46,7 +46,6 @@ _optional = {
     'HASH_KEY': None,
     'SMART_THROTTLE': False,
     'MAX_CAPTCHAS': 0,
-    'ACCOUNTS': (),
     'ENCOUNTER': None,
     'NOTIFY': False,
     'AUTHKEY': b'm3wtw0',
@@ -132,7 +131,7 @@ if config.FORCED_KILL is True:
 if not config.COROUTINES_LIMIT:
     config.COROUTINES_LIMIT = config.GRID[0] * config.GRID[1]
 
-from monocle.shared import LOOP, get_logger, SessionManager
+from monocle.shared import LOOP, get_logger, SessionManager, ACCOUNTS
 from monocle.utils import get_address, dump_pickle
 from monocle.worker import Worker
 from monocle.overseer import Overseer
@@ -252,7 +251,7 @@ def cleanup(overseer, manager, checker):
         overseer.refresh_dict()
 
         print('Dumping pickles...')
-        dump_pickle('accounts', Worker.accounts)
+        dump_pickle('accounts', ACCOUNTS)
         FORT_CACHE.pickle()
         if config.CACHE_CELLS:
             dump_pickle('cells', Worker.cell_ids)
