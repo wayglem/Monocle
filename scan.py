@@ -16,13 +16,14 @@ except ImportError:
 from multiprocessing.managers import BaseManager, DictProxy
 from queue import Queue, Full
 from argparse import ArgumentParser
-from signal import signal, SIGINT, SIG_IGN
+from signal import signal, SIGINT, SIGTERM, SIG_IGN
 from logging import getLogger, basicConfig, WARNING, INFO
-from pogo_async import close_sessions
 from os.path import exists, join
-from threading import Thread
 from sys import platform
+from concurrent.futures import TimeoutError
+
 from sqlalchemy.exc import DBAPIError
+from aiopogo import close_sessions
 
 import time
 
@@ -69,7 +70,12 @@ _optional = {
     'FORCED_KILL': None,
     'SWAP_WORST': 600,
     'REFRESH_RATE': 0.6,
-    'SPEED_LIMIT': 19.5
+    'SPEED_LIMIT': 19.5,
+    'COROUTINES_LIMIT': None,
+    'GOOD_ENOUGH': None,
+    'SEARCH_SLEEP': 2.5,
+    'STAT_REFRESH': 5,
+    'FAVOR_CAPTCHA': True
 }
 for setting_name, default in _optional.items():
     if not hasattr(config, setting_name):
@@ -121,12 +127,19 @@ if config.DIRECTORY is None:
         config.DIRECTORY = ''
 
 if config.FORCED_KILL is True:
-    config.FORCED_KILL = ('0.57.2', '0.55.0', '0.53.0', '0.53.1', '0.53.2')
+    config.FORCED_KILL = ('0.57.2', '0.57.3', '0.55.0', '0.53.0', '0.53.1', '0.53.2')
 
+if not config.COROUTINES_LIMIT:
+    config.COROUTINES_LIMIT = config.GRID[0] * config.GRID[1]
+
+from monocle.shared import LOOP, get_logger, SessionManager
 from monocle.utils import get_address, dump_pickle
 from monocle.worker import Worker
 from monocle.overseer import Overseer
-from monocle import shared
+from monocle.db_proc import DB_PROC
+from monocle.db import FORT_CACHE
+from monocle.spawns import SPAWNS
+
 
 class AccountManager(BaseManager):
     pass
@@ -219,9 +232,55 @@ def exception_handler(loop, context):
         print('Exception in exception handler.')
 
 
+def cleanup(overseer, manager, checker):
+    try:
+        checker.cancel()
+        print('Exiting, please wait until all tasks finish')
+
+        log = get_logger('cleanup')
+        print('Finishing tasks...')
+        pending = asyncio.Task.all_tasks(loop=LOOP)
+        gathered = asyncio.gather(*pending, return_exceptions=True)
+        try:
+            LOOP.run_until_complete(asyncio.wait_for(gathered, 30))
+        except TimeoutError as e:
+            print('Coroutine completion timed out, moving on.')
+        except Exception as e:
+            log = get_logger('cleanup')
+            log.exception('A wild {} appeared during exit!', e.__class__.__name__)
+
+        overseer.refresh_dict()
+
+        print('Dumping pickles...')
+        dump_pickle('accounts', Worker.accounts)
+        FORT_CACHE.pickle()
+        if config.CACHE_CELLS:
+            dump_pickle('cells', Worker.cell_ids)
+
+        DB_PROC.stop()
+        print("Updating spawns pickle...")
+        try:
+            SPAWNS.update()
+        except Exception as e:
+            log.warning('A wild {} appeared while updating spawns during exit!', e.__class__.__name__)
+        while not DB_PROC.queue.empty():
+            pending = DB_PROC.queue.qsize()
+            # Spaces at the end are important, as they clear previously printed
+            # output - \r doesn't clean whole line
+            print('{} DB items pending     '.format(pending), end='\r')
+            time.sleep(.5)
+    finally:
+        print('Closing pipes, sessions, and event loop...')
+        manager.shutdown()
+        SessionManager.close()
+        close_sessions()
+        LOOP.close()
+        print('Done.')
+
+
 def main():
     args = parse_args()
-    log = shared.get_logger()
+    log = get_logger()
     if args.status_bar:
         configure_logger(filename=join(config.DIRECTORY, 'scan.log'))
         log.info('-' * 37)
@@ -245,52 +304,21 @@ def main():
         else:
             raise OSError('Another instance is running with the same socket. Stop that process or: rm {}'.format(address)) from e
 
-    loop = asyncio.get_event_loop()
-    loop.set_exception_handler(exception_handler)
+    LOOP.set_exception_handler(exception_handler)
 
     overseer = Overseer(status_bar=args.status_bar, manager=manager)
     overseer.start()
-    overseer_thread = Thread(target=overseer.check, name='overseer', daemon=True)
-    overseer_thread.start()
-
-    launcher_thread = Thread(target=overseer.launch, name='launcher', daemon=True, args=(args.bootstrap, args.pickle))
-    launcher_thread.start()
-
+    checker = asyncio.ensure_future(overseer.check())
+    launcher = asyncio.ensure_future(overseer.launch(args.bootstrap, args.pickle))
+    if platform != 'win32':
+        LOOP.add_signal_handler(SIGINT, launcher.cancel)
+        LOOP.add_signal_handler(SIGTERM, launcher.cancel)
     try:
-        while True:
-            try:
-                loop.run_forever()
-            except Exception:
-                log.exception('Caught error on run_forever, restarting loop')
-                time.sleep(5)
+        LOOP.run_until_complete(launcher)
     except KeyboardInterrupt:
-        print('Exiting, please wait until all tasks finish')
-        overseer.kill()
-
-        dump_pickle('accounts', Worker.accounts)
-        if config.CACHE_CELLS:
-            dump_pickle('cells', Worker.cell_ids)
-
-        pending = asyncio.Task.all_tasks(loop=loop)
-        try:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        except Exception as e:
-            log.exception('A wild {} appeared during exit!', e.__class__.__name__)
-
-        shared.DB.stop()
-
-        try:
-            shared.spawns.update()
-        except Exception:
-            pass
+        launcher.cancel()
     finally:
-        manager.shutdown()
-        close_sessions()
-
-        try:
-            loop.close()
-        except RuntimeError:
-            pass
+        cleanup(overseer, manager, checker)
 
 
 if __name__ == '__main__':

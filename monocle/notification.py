@@ -1,18 +1,21 @@
 from datetime import datetime, timedelta, timezone
 from collections import deque
 from math import sqrt
-from time import monotonic
+from time import monotonic, time
 from pkg_resources import resource_stream
-from tempfile import NamedTemporaryFile
+from tempfile import TemporaryFile
+from asyncio import gather, TimeoutError
+
+import json
+
+from aiohttp import ClientError, DisconnectedError, HttpProcessingError
 
 from .utils import load_pickle, dump_pickle
 from .db import session_scope, get_pokemon_ranking, estimate_remaining_time
 from .names import POKEMON_NAMES, POKEMON_MOVES
-from .shared import get_logger
+from .shared import get_logger, SessionManager, LOOP, run_threaded
 
 from . import config
-
-import requests
 
 
 # set unset config options to None
@@ -32,8 +35,7 @@ _optional = {
     'FULL_TIME': 1800,
     'TIME_REQUIRED': 300,
     'NOTIFY_RANKING': 90,
-    'ALWAYS_NOTIFY_IDS': set(),
-    'NOTIFICATION_CACHE': 100
+    'ALWAYS_NOTIFY_IDS': set()
 }
 # set defaults for unset config options
 for setting_name, default in _optional.items():
@@ -51,10 +53,13 @@ if config.NOTIFY:
     if all((config.TWITTER_CONSUMER_KEY, config.TWITTER_CONSUMER_SECRET,
             config.TWITTER_ACCESS_KEY, config.TWITTER_ACCESS_SECRET)):
         try:
-            import twitter
-            from twitter.twitter_utils import calc_expected_status_length
+            import peony.utils
+            def _get_image_metadata(file_):
+                return 'image/png', 'tweet_image', True, file_
+            peony.utils.get_image_metadata = _get_image_metadata
+            from peony import PeonyClient
         except ImportError as e:
-            raise ImportError("You specified a TWITTER_ACCESS_KEY but you don't have python-twitter installed.") from e
+            raise ImportError("You specified a TWITTER_ACCESS_KEY but you don't have peony-twitter installed.") from e
         TWITTER=True
 
         if config.TWEET_IMAGES:
@@ -67,19 +72,27 @@ if config.NOTIFY:
 
     if config.PB_API_KEY:
         try:
-            from pushbullet import Pushbullet
+            from asyncpushbullet import AsyncPushbullet
         except ImportError as e:
-            raise ImportError("You specified a PB_API_KEY but you don't have pushbullet.py installed.") from e
+            raise ImportError("You specified a PB_API_KEY but you don't have asyncpushbullet installed.") from e
         PUSHBULLET=True
 
     if config.WEBHOOKS:
-        if not isinstance(config.WEBHOOKS, (set, list, tuple)):
-            raise ValueError('WEBHOOKS must be a set of addresses.')
-        try:
-            import requests
-        except ImportError as e:
-            raise ImportError("You specified a WEBHOOKS address but you don't have requests installed.") from e
-        WEBHOOK = True
+        if isinstance(config.WEBHOOKS, (set, list, tuple)):
+            if len(config.WEBHOOKS) == 1:
+                try:
+                    HOOK_POINT = config.WEBHOOKS.pop()
+                except AttributeError:
+                    HOOK_POINT = config.WEBHOOKS[0]
+                WEBHOOK = 1
+            else:
+                HOOK_POINTS = config.WEBHOOKS
+                WEBHOOK = 2
+        elif isinstance(config.WEBHOOKS, str):
+            HOOK_POINT = config.WEBHOOKS
+            WEBHOOK = 1
+        else:
+            raise ValueError('WEBHOOKS must be a set or list of addresses, or a string with one address.')
     if config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID:
         TELEGRAM=True
 
@@ -98,6 +111,21 @@ if config.NOTIFY:
         raise ValueError('Only set NOTIFY_RANKING or NOTIFY_IDS, not both.')
     elif not any((config.NOTIFY_RANKING, config.NOTIFY_IDS, config.ALWAYS_NOTIFY_IDS)):
         raise ValueError('Must set either NOTIFY_RANKING, NOTIFY_IDS, or ALWAYS_NOTIFY_IDS.')
+
+
+class NotificationCache:
+    def __init__(self):
+        self.store = set()
+
+    def __contains__(self, item):
+        return item in self.store
+
+    def add(self, item, delay):
+        self.store.add(item)
+        return LOOP.call_later(delay, self.remove, item)
+
+    def remove(self, item):
+        self.store.discard(item)
 
 
 class PokeImage:
@@ -125,9 +153,8 @@ class PokeImage:
         self.draw_stats()
         self.draw_image(pokepic, 204, 224)
         self.draw_name()
-        image = NamedTemporaryFile(suffix='.png', delete=True)
+        image = TemporaryFile(suffix='.png')
         ims.write_to_png(image)
-        image.mode = 'rb'
         return image
 
     def draw_stats(self):
@@ -227,8 +254,8 @@ class PokeImage:
         self.context.set_source_rgba(1, 1, 1)
         self.context.show_text(self.name)
 
-class Notification:
 
+class Notification:
     def __init__(self, pokemon, score, time_of_day):
         self.pokemon = pokemon
         self.name = POKEMON_NAMES[pokemon['pokemon_id']]
@@ -294,11 +321,10 @@ class Notification:
                 self.max_expire_time = (
                     now + max_delta).strftime('%I:%M %p').lstrip('0')
 
-        self.map_link = 'https://maps.google.com/maps?q={0[0]:.5f},{0[1]:.5f}'.format(
-            self.coordinates)
+        self.map_link = 'https://maps.google.com/maps?q={0[0]:.5f},{0[1]:.5f}'.format(self.coordinates)
         self.place = None
 
-    def notify(self):
+    async def notify(self):
         if config.LANDMARKS and (TWITTER or PUSHBULLET):
             self.landmark = config.LANDMARKS.find_landmark(self.coordinates)
 
@@ -321,61 +347,68 @@ class Notification:
         pushed = False
         telegram = False
 
+        notifications = []
         if PUSHBULLET:
-            pushed = self.pbpush()
+            notifications.append(self.pbpush())
 
         if TWITTER:
-            tweeted = self.tweet()
+            notifications.append(self.tweet())
 
         if TELEGRAM:
-            telegram = self.sendToTelegram()
+            notifications.append(self.sendToTelegram())
 
-        return tweeted or pushed or telegram
+        results = await gather(*notifications, loop=LOOP)
+        return True in results
 
-    def sendToTelegram(self):
+    async def sendToTelegram(self):
+        session = SessionManager.get()
+        TELEGRAM_BASE_URL = "https://api.telegram.org/bot{token}/sendVenue".format(token=config.TELEGRAM_BOT_TOKEN)
+        title = self.name
         try:
-            TELEGRAM_BASE_URL = "https://api.telegram.org/bot{token}/sendVenue".format(token=config.TELEGRAM_BOT_TOKEN)
-            title = self.name
-            try:
-                minutes, seconds = divmod(self.tth, 60)
-                description = 'Expires at: {} ({:.0f}m{:.0f}s left)'.format(self.expire_time, minutes, seconds)
-            except AttributeError:
-                description = "It'll expire between {} & {}.".format(self.min_expire_time, self.max_expire_time)
+            minutes, seconds = divmod(self.tth, 60)
+            description = 'Expires at: {} ({:.0f}m{:.0f}s left)'.format(self.expire_time, minutes, seconds)
+        except AttributeError:
+            description = "It'll expire between {} & {}.".format(self.min_expire_time, self.max_expire_time)
 
-            try:
-                title += ' ({}/{}/{})'.format(self.attack, self.defense, self.stamina)
-            except AttributeError:
-                pass
+        try:
+            title += ' ({}/{}/{})'.format(self.attack, self.defense, self.stamina)
+        except AttributeError:
+            pass
 
-            payload = {
-                'chat_id': config.TELEGRAM_CHAT_ID,
-                'latitude': self.coordinates[0],
-                'longitude': self.coordinates[1],
-                'title' : title,
-                'address' : description,
-            }
+        payload = {
+            'chat_id': config.TELEGRAM_CHAT_ID,
+            'latitude': self.coordinates[0],
+            'longitude': self.coordinates[1],
+            'title' : title,
+            'address' : description,
+        }
 
-            r = requests.get(TELEGRAM_BASE_URL, params=payload, timeout=5)
-            if r.status_code == 200:
+        try:
+            async with session.post(TELEGRAM_BASE_URL, data=payload) as resp:
+                try:
+                    resp.raise_for_status()
+                except HttpProcessingError as e:
+                    try:
+                        response = await resp.json()
+                        self.log.error('Error {} from Telegram: {}', e.code, response['description'])
+                    except Exception:
+                        self.log.error('Error {} from Telegram: {}', e.code, e.message)
+                    return False
                 self.log.info('Sent a Telegram notification about {}.', self.name)
-                return True
-            else:
-                self.log.info('Failed to send a Telegram notification about {}.', self.name)
-                return False
+        except (ClientError, DisconnectedError) as e:
+            err = e.__cause__ or e
+            self.log.error('{} during Telegram notification.', err.__class__.__name__)
+            return False
         except Exception:
             self.log.exception('Exception caught in Telegram notification.')
             return False
 
-    def pbpush(self):
+    async def pbpush(self):
         """ Send a PushBullet notification either privately or to a channel,
         depending on whether or not PB_CHANNEL is set in config.
         """
 
-        try:
-            pb = Pushbullet(config.PB_API_KEY)
-        except Exception:
-            self.log.exception('Failed to create a PushBullet object.')
-            return False
+        pb = self.get_pushbullet_client()
 
         description = self.description
         try:
@@ -414,9 +447,9 @@ class Notification:
         try:
             try:
                 channel = pb.channels[config.PB_CHANNEL]
-                channel.push_link(title, self.map_link, body)
             except (IndexError, KeyError):
-                pb.push_link(title, self.map_link, body)
+                channel = None
+            await pb.async_push_link(title, self.map_link, body, channel=channel)
         except Exception:
             self.log.exception('Failed to send a PushBullet notification about {}.', self.name)
             return False
@@ -424,47 +457,11 @@ class Notification:
             self.log.info('Sent a PushBullet notification about {}.', self.name)
             return True
 
-    def tweet(self):
-        """ Create message, reduce it until it fits in a tweet, and then tweet
-        it with a link to Google maps and tweet location included.
-        """
-
-        def generate_tag_string(hashtags):
-            '''create hashtag string'''
-            tag_string = ''
-            if hashtags:
-                for hashtag in hashtags:
-                    tag_string += ' #{}'.format(hashtag)
-            return tag_string
-
-        try:
-            api = twitter.Api(consumer_key=config.TWITTER_CONSUMER_KEY,
-                              consumer_secret=config.TWITTER_CONSUMER_SECRET,
-                              access_token_key=config.TWITTER_ACCESS_KEY,
-                              access_token_secret=config.TWITTER_ACCESS_SECRET)
-        except Exception:
-            self.log.exception('Failed to create a Twitter API object.')
-
-        tag_string = generate_tag_string(self.hashtags)
-
-        try:
-            tweet_text = (
-                'A {d} {n} appeared! It will be {p} until {e}. {t} {u}').format(
-                d=self.description, n=self.name, p=self.place,
-                e=self.expire_time, t=tag_string, u=self.map_link)
-        except AttributeError:
-            tweet_text = (
-                'A {d} {n} appeared {p}! It will expire sometime between '
-                '{e1} and {e2}. {t} {u}').format(
-                d=self.description, n=self.name, p=self.place,
-                e1=self.min_expire_time, e2=self.max_expire_time,
-                t=tag_string, u=self.map_link)
-
-        if calc_expected_status_length(tweet_text) > 140:
-            tweet_text = tweet_text.replace(' meters ', 'm ')
+    def shorten_tweet(self, tweet_text):
+        tweet_text = tweet_text.replace(' meters ', 'm ')
 
         # remove hashtags until length is short enough
-        while calc_expected_status_length(tweet_text) > 140:
+        while len(tweet_text) > 116:
             if self.hashtags:
                 hashtag = self.hashtags.pop()
                 tweet_text = tweet_text.replace(' #' + hashtag, '')
@@ -472,57 +469,100 @@ class Notification:
                 break
 
         try:
-            if calc_expected_status_length(tweet_text) > 140:
+            if len(tweet_text) > 116:
                 tweet_text = tweet_text.replace(self.landmark.name,
                                                 self.landmark.shortname)
+            else:
+                return tweet_text
 
-            if calc_expected_status_length(tweet_text) > 140:
+            if len(tweet_text) > 116:
                 place = self.landmark.shortname or self.landmark.name
                 phrase = self.landmark.phrase
                 if self.place.startswith(phrase):
-                    place_string = '{ph} {pl}'.format(ph=phrase, pl=place)
+                    place_string = '{} {}'.format(phrase, place)
                 else:
                     place_string = 'near {}'.format(place)
                 tweet_text = tweet_text.replace(self.place, place_string)
+            else:
+                return tweet_text
         except AttributeError:
             pass
 
-        if calc_expected_status_length(tweet_text) > 140:
+        if len(tweet_text) > 116:
             try:
-                tweet_text = 'A {d} {n} will be {p} until {e}. {u}'.format(
+                tweet_text = 'A {d} {n} will be {p} until {e}.'.format(
                              d=self.description, n=self.name,
-                             p=place_string, e=self.expire_time,
-                             u=self.map_link)
+                             p=place_string, e=self.expire_time)
             except AttributeError:
                 tweet_text = (
                     "A {d} {n} appeared {p}! It'll expire between {e1} & {e2}."
-                    ' {u}').format(d=self.description, n=self.name,
-                                   p=place_string, e1=self.min_expire_time,
-                                   e2=self.max_expire_time, u=self.map_link)
+                    ).format(d=self.description, n=self.name, p=place_string,
+                             e1=self.min_expire_time, e2=self.max_expire_time)
+        else:
+            return tweet_text
 
-        if calc_expected_status_length(tweet_text) > 140:
+        if len(tweet_text) > 116:
             try:
-                tweet_text = 'A {d} {n} will expire at {e}. {u}'.format(
-                             n=self.name, e=self.expire_time, u=self.map_link)
+                tweet_text = 'A {d} {n} will expire at {e}.'.format(
+                             n=self.name, e=self.expire_time)
             except AttributeError:
                 tweet_text = (
-                    'A {d} {n} will expire between {e1} & {e2}. {u}').format(
+                    'A {d} {n} will expire between {e1} & {e2}.').format(
                     d=self.description, n=self.name, e1=self.min_expire_time,
-                    e2=self.max_expire_time, u=self.map_link)
+                    e2=self.max_expire_time)
+        else:
+            return tweet_text
 
-        image = None
+    async def tweet(self):
+        """ Create message, reduce it until it fits in a tweet, and then tweet
+        it with a link to Google maps and tweet location included.
+        """
+
+        tag_string = ''
+        try:
+            for hashtag in self.hashtags:
+                tag_string += ' #{}'.format(hashtag)
+        except TypeError:
+            pass
+
+        try:
+            tweet_text = (
+                'A {d} {n} appeared! It will be {p} until {e}. {t}').format(
+                d=self.description, n=self.name, p=self.place,
+                e=self.expire_time, t=tag_string)
+        except AttributeError:
+            tweet_text = (
+                'A {d} {n} appeared {p}! It will expire sometime between '
+                '{e1} and {e2}. {t}').format(
+                d=self.description, n=self.name, p=self.place,
+                e1=self.min_expire_time, e2=self.max_expire_time,
+                t=tag_string)
+
+        if len(tweet_text) > 116:
+            tweet_text = self.shorten_tweet(tweet_text)
+
+        tweet_text += ' ' + self.map_link
+
+        media_id = None
+        client = self.get_twitter_client()
         if config.TWEET_IMAGES:
             try:
                 image = PokeImage(self.pokemon, self.move1, self.move2, self.time_of_day).create()
             except Exception:
                 self.log.exception('Failed to create a Tweet image.')
-
+            else:
+                try:
+                    media = await client.upload_media(image, auto_convert=False)
+                    media_id = media['media_id']
+                except Exception:
+                    self.log.exception('Failed to upload Tweet image.')
         try:
-            api.PostUpdate(tweet_text,
-                           media=image,
-                           latitude=self.coordinates[0],
-                           longitude=self.coordinates[1],
-                           display_coordinates=True)
+            await client.api.statuses.update.post(
+                status=tweet_text,
+                media_ids=media_id,
+                lat=str(self.coordinates[0]),
+                long=str(self.coordinates[1]),
+                display_coordinates=True)
         except Exception:
             self.log.exception('Failed to tweet about {}.', self.name)
             return False
@@ -546,11 +586,35 @@ class Notification:
             # no landmarks or area name defined, just say 'around'
             return 'around'
 
+    @classmethod
+    def get_pushbullet_client(cls):
+        try:
+            return cls._pushbullet_client
+        except AttributeError:
+            cls._pushbullet_client = AsyncPushbullet(
+                api_key=config.PB_API_KEY,
+                loop=LOOP)
+            return cls._pushbullet_client
+
+    @classmethod
+    def get_twitter_client(cls):
+        try:
+            return cls._twitter_client
+        except AttributeError:
+            cls._twitter_client = PeonyClient(
+                consumer_key=config.TWITTER_CONSUMER_KEY,
+                consumer_secret=config.TWITTER_CONSUMER_SECRET,
+                access_token=config.TWITTER_ACCESS_KEY,
+                access_token_secret=config.TWITTER_ACCESS_SECRET,
+                session=SessionManager.get(),
+                loop=LOOP)
+            return cls._twitter_client
+
 
 class Notifier:
 
     def __init__(self):
-        self.recent_notifications = deque(maxlen=config.NOTIFICATION_CACHE)
+        self.cache = NotificationCache()
         self.notify_ranking = config.NOTIFY_RANKING
         self.initial_score = config.INITIAL_SCORE
         self.minimum_score = config.MINIMUM_SCORE
@@ -559,29 +623,36 @@ class Notifier:
         self.log = get_logger('notifier')
         self.never_notify = config.NEVER_NOTIFY_IDS or tuple()
         self.rarity_override = config.RARITY_OVERRIDE or {}
+        self.sent = 0
         if self.notify_ranking:
-            self.set_pokemon_ranking(loadpickle=True)
-            self.set_notify_ids()
-            self.auto = True
+            self.initialize_ranking()
+            LOOP.call_later(3600, self.set_notify_ids)
         elif config.NOTIFY_IDS or config.ALWAYS_NOTIFY_IDS:
             self.notify_ids = config.NOTIFY_IDS or config.ALWAYS_NOTIFY_IDS
             self.always_notify = config.ALWAYS_NOTIFY_IDS
             self.notify_ranking = len(self.notify_ids)
-            self.auto = False
-        if WEBHOOK:
-            self.wh_session = requests.Session()
 
     def set_notify_ids(self):
+        LOOP.create_task(self._set_notify_ids())
+        LOOP.call_later(3600, self.set_notify_ids)
+
+    async def _set_notify_ids(self):
+        await run_threaded(self.set_ranking)
         self.notify_ids = self.pokemon_ranking[0:self.notify_ranking]
         self.always_notify = set(self.pokemon_ranking[0:config.ALWAYS_NOTIFY])
         self.always_notify |= set(config.ALWAYS_NOTIFY_IDS)
+        self.log.info('Updated Pokemon rankings.')
 
-    def set_pokemon_ranking(self, loadpickle=False):
-        self.ranking_time = monotonic()
-        if loadpickle:
-            self.pokemon_ranking = load_pickle('ranking')
-            if self.pokemon_ranking:
-                return
+    def initialize_ranking(self):
+        self.pokemon_ranking = load_pickle('ranking')
+        if self.pokemon_ranking:
+            self.notify_ids = self.pokemon_ranking[0:self.notify_ranking]
+            self.always_notify = set(self.pokemon_ranking[0:config.ALWAYS_NOTIFY])
+            self.always_notify |= set(config.ALWAYS_NOTIFY_IDS)
+        else:
+            LOOP.run_until_complete(self._set_notify_ids())
+
+    def set_ranking(self):
         try:
             with session_scope() as session:
                 self.pokemon_ranking = get_pokemon_ranking(session)
@@ -616,17 +687,18 @@ class Notifier:
         if pokemon_id in self.never_notify:
             return False
         if pokemon_id in self.always_notify:
-            return encounter_id not in self.recent_notifications
-        if pokemon_id not in self.notify_ids:
+            return encounter_id not in self.cache
+        if (pokemon_id not in self.notify_ids
+                and pokemon_id not in self.rarity_override):
             return False
         if config.IGNORE_RARITY:
-            return encounter_id not in self.recent_notifications
+            return encounter_id not in self.cache
         try:
             if pokemon['time_till_hidden'] < config.TIME_REQUIRED:
                 return False
         except KeyError:
             pass
-        if encounter_id in self.recent_notifications:
+        if encounter_id in self.cache:
             return False
 
         rareness = self.get_rareness_score(pokemon_id)
@@ -634,20 +706,27 @@ class Notifier:
         score_required = self.get_required_score()
         return highest_score > score_required
 
-    def notify(self, pokemon, time_of_day):
+    def cleanup(self, encounter_id, handle):
+        self.cache.remove(encounter_id)
+        handle.cancel()
+        return False
+
+    async def notify(self, pokemon, time_of_day):
         """Send a PushBullet notification and/or a Tweet, depending on if their
         respective API keys have been set in config.
         """
+        whpushed = False
+        notified = False
 
         pokemon_id = pokemon['pokemon_id']
         name = POKEMON_NAMES[pokemon_id]
 
-        now = monotonic()
-        if self.auto:
-            if now - self.ranking_time > 3600:
-                self.set_pokemon_ranking()
-                self.set_notify_ids()
+        encounter_id = pokemon['encounter_id']
+        if encounter_id in self.cache:
+            self.log.info("{} was already notified about.", name)
+            return False
 
+        now = monotonic()
         if pokemon_id in self.always_notify:
             score_required = 0
         else:
@@ -684,33 +763,42 @@ class Notifier:
 
         if 'time_till_hidden' not in pokemon:
             seen = pokemon['seen'] % 3600
+            self.cache.store.add(pokemon['encounter_id'])
             try:
                 with session_scope() as session:
-                    tth = estimate_remaining_time(session, pokemon['spawn_id'], seen)
+                    tth = await run_threaded(estimate_remaining_time, session, pokemon['spawn_id'], seen)
             except Exception:
                 self.log.exception('An exception occurred while trying to estimate remaining time.')
-                return False
+                now_epoch = time()
+                tth = (pokemon['seen'] + 90 - now_epoch, pokemon['seen'] + 3600 - now_epoch)
+            LOOP.call_later(tth[1], self.cache.remove, pokemon['encounter_id'])
             if pokemon_id not in self.always_notify:
                 mean = sum(tth) / 2
                 if mean < config.TIME_REQUIRED:
                     self.log.info('{} has only around {} seconds remaining.', name, mean)
                     return False
             pokemon['earliest_tth'], pokemon['latest_tth'] = tth
+        else:
+            cache_handle = self.cache.add(pokemon['encounter_id'], pokemon['time_till_hidden'])
 
-        whpushed = False
-        if WEBHOOK:
-            whpushed = self.webhook(pokemon)
-
-        notified = False
-        if NATIVE:
-            notified = Notification(pokemon, iv_score, time_of_day).notify()
+        if WEBHOOK and NATIVE:
+            notified, whpushed = await gather(
+                Notification(pokemon, iv_score, time_of_day).notify(),
+                self.webhook(pokemon),
+                loop=LOOP)
+        elif NATIVE:
+            notified = await Notification(pokemon, iv_score, time_of_day).notify()
+        elif WEBHOOK:
+            whpushed = await self.webhook(pokemon)
 
         if notified or whpushed:
             self.last_notification = monotonic()
-            self.recent_notifications.append(pokemon['encounter_id'])
-        return notified or whpushed
+            self.sent += 1
+            return True
+        else:
+            return self.cleanup(encounter_id, cache_handle)
 
-    def webhook(self, pokemon):
+    async def webhook(self, pokemon):
         """ Send a notification via webhook
         """
         try:
@@ -743,13 +831,33 @@ class Notifier:
         except KeyError:
             pass
 
-        ret = False
-        for w in config.WEBHOOKS:
-            try:
-                self.wh_session.post(w, json=data, timeout=(1, 1))
-                ret = True
-            except requests.exceptions.Timeout:
-                self.log.warning('Response timeout on webhook endpoint {}', w)
-            except requests.exceptions.RequestException as e:
-                self.log.warning('Request Error: {}', e)
-        return ret
+        payload = json.dumps(data)
+        session = SessionManager.get()
+        return await self.wh_send(session, payload)
+
+    if WEBHOOK > 1:
+        async def wh_send(self, session, payload):
+            results = await gather(*tuple(self.hook_post(w, session, payload) for w in HOOK_POINTS), loop=LOOP)
+            return True in results
+    else:
+        async def wh_send(self, session, payload):
+            return await self.hook_post(HOOK_POINT, session, payload)
+
+    async def hook_post(self, w, session, payload):
+        try:
+            async with session.post(w, data=payload, timeout=3) as resp:
+                resp.raise_for_status()
+                return True
+        except HttpProcessingError as e:
+            self.log.error('Error {} from webook {}: {}', e.code, w, e.message)
+            return False
+        except TimeoutError:
+            self.log.error('Response timeout from webhook: {}', w)
+            return False
+        except (ClientError, DisconnectedError) as e:
+            err = e.__cause__ or e
+            self.log.error('{} on webhook: {}', err.__class__.__name__, w)
+            return False
+        except Exception:
+            self.log.exception('Error from webhook: {}', w)
+            return False

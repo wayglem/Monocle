@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 from multiprocessing.managers import BaseManager
-from pogo_async import PGoApi, close_sessions, exceptions as ex
-from pogo_async.auth_ptc import AuthPtc
+from aiopogo import PGoApi, close_sessions, exceptions as ex
+from aiopogo.auth_ptc import AuthPtc
 from asyncio import get_event_loop, sleep
 from random import uniform
 from selenium import webdriver
@@ -112,7 +112,7 @@ async def main():
                                                  provider=account.get('provider', 'ptc'))
 
                 request = api.create_request()
-                request.download_remote_config_version(platform=1, app_version=5702)
+                request.download_remote_config_version(platform=1, app_version=5703)
                 request.check_challenge()
                 request.get_hatched_eggs()
                 request.get_inventory()

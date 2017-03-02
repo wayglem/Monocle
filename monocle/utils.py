@@ -16,7 +16,7 @@ from logging import getLogger
 
 from geopy import Point
 from geopy.distance import distance
-from pogo_async import utilities as pgoapi_utils
+from aiopogo import utilities as pgoapi_utils
 
 try:
     from numba import jit
@@ -25,6 +25,7 @@ except ImportError:
         return func
 
 from . import config
+from .shared import LOOP
 
 _optional = {
     'ALT_RANGE': (300, 400),
@@ -243,8 +244,11 @@ def get_bootstrap_points():
 def get_device_info(account):
     device_info = {'brand': 'Apple',
                    'device': 'iPhone',
-                   'manufacturer': 'Apple',
-                   'product': 'iPhone OS'}
+                   'manufacturer': 'Apple'}
+    if account['iOS'].startswith('1'):
+        device_info['product'] = 'iOS'
+    else:
+        device_info['product'] = 'iPhone OS'
     device_info['hardware'] = account['model']
     device_info['model'] = IPHONES[account['model']]
     device_info['version'] = account['iOS']
@@ -404,6 +408,6 @@ def randomize_point(point, amount=0.0003):
 async def random_sleep(minimum=10, maximum=13, mode=None):
     """Sleeps for a bit"""
     if mode:
-        await sleep(random.triangular(minimum, maximum, mode))
+        await sleep(random.triangular(minimum, maximum, mode), loop=LOOP)
     else:
-        await sleep(random.uniform(minimum, maximum))
+        await sleep(random.uniform(minimum, maximum), loop=LOOP)

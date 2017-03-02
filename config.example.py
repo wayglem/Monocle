@@ -47,6 +47,14 @@ SIMULTANEOUS_LOGINS = 4
 # Limit the number of workers simulating the app startup process simultaneously.
 SIMULTANEOUS_SIMULATION = 10
 
+# Immediately select workers whose speed are below (SPEED_UNIT)p/h instead of
+# continuing to try to find the worker with the lowest speed.
+# May increase clustering if you have a high density of workers.
+#GOOD_ENOUGH = 4
+
+# Seconds to sleep after failing to find an eligible worker before trying again.
+SEARCH_SLEEP = 2.5
+
 ## alternatively define a Polygon to use as boundaries (requires shapely)
 ## if BOUNDARIES is set, STAY_WITHIN_MAP will be ignored
 ## more information available in the shapely manual:
@@ -124,6 +132,8 @@ SWAP_WORST = 600  # 10 minutes
 
 # Update the console output every x seconds
 REFRESH_RATE = 0.6  # 600ms
+# Update the seen/speed/visit/speed stats every x seconds
+STAT_REFRESH = 5
 
 # sent with GET_PLAYER requests, should match your region
 PLAYER_LOCALE = {'country': 'US', 'language': 'en', 'timezone': 'America/Denver'}
@@ -164,6 +174,8 @@ REPORT_MAPS = True  # Show maps on reports
 #CAPTCHA_KEY = '1abc234de56fab7c89012d34e56fa7b8'
 ## the number of CAPTCHAs an account is allowed to receive before being swapped out
 #CAPTCHAS_ALLOWED = 3
+## Get new accounts from the CAPTCHA queue first if it's not empty
+#FAVOR_CAPTCHA = True
 
 MAP_WORKERS = True  # allow displaying the live location of workers on the map
 
@@ -172,8 +184,8 @@ LAST_MIGRATION = 1481932800  # Dec. 17th, 2016
 
 ## Map data provider and appearance, previews available at:
 ## https://leaflet-extras.github.io/leaflet-providers/preview/
-#MAP_PROVIDER_URL = '//{s}.tile.osm.org/{z}/{x}/{y}.png'
-#MAP_PROVIDER_ATTRIBUTION = '&copy; <a href="http://osm.org/copyright">OpenStreetMap</a> contributors'
+#MAP_PROVIDER_URL = '//{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'
+#MAP_PROVIDER_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
 
 # set of proxy addresses and ports
 # SOCKS requires aiosocks to be installed
@@ -200,6 +212,9 @@ LAST_MIGRATION = 1481932800  # Dec. 17th, 2016
 
 # Disable to use Python's event loop even if uvloop is installed
 #UVLOOP = True
+
+# The number of coroutines that are allowed to run simultaneously.
+#COROUTINES_LIMIT = GRID[0] * GRID[1]
 
 ### FRONTEND CONFIGURATION
 LOAD_CUSTOM_HTML_FILE = False # File path MUST be 'templates/custom.html'
@@ -267,10 +282,6 @@ ALWAYS_NOTIFY = 14
 FULL_TIME = 1800  # the number of seconds after a notification when only MINIMUM_SCORE will be required
 INITIAL_SCORE = 0.7  # the required score immediately after a notification
 MINIMUM_SCORE = 0.4  # the required score after FULL_TIME seconds have passed
-
-# the number of encounter_ids to retain for duplicate checking. Should be at
-# least as high as the highest number of notifications you'd send in an hour.
-NOTIFICATION_CACHE = 100
 
 ### The following values are fake, replace them with your own keys to enable
 ### notifications, otherwise leave them out of your config or set them to None.

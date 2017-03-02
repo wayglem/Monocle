@@ -48,8 +48,8 @@ Since it uses [Leaflet](http://leafletjs.com/) for mapping, the appearance and d
 3. Copy `config.example.py` to `monocle/config.py` and customize it with your accounts, location, database information, and any other relevant settings. The comments in the config example provide some information about the options.
 4. `pip3 install -r requirements.txt`
   * Optionally `pip3 install` additional packages listed in optional-requirements
-    * *pushbullet.py* is required for pushbullet notifications
-    * *python-twitter* is required for twitter notifications
+    * *asyncpushbullet* is required for PushBullet notifications
+    * *peony-twitter* is required for Twitter notifications
     * *stem* is required for proxy circuit swapping
     * *shapely* is required for landmarks or spawnpoint scan boundaries
     * *selenium* (and [ChromeDriver](https://sites.google.com/a/chromium.org/chromedriver/)) are required for solving CAPTCHAs
@@ -90,6 +90,6 @@ The gyms statistics server is in a separate file, because it's intended to be sh
 
 See [LICENSE](LICENSE).
 
-This project is based on the coroutines branch of [pokeminer](https://github.com/modrzew/pokeminer/tree/coroutines) (now discontinued). *Pokeminer* was originally based on an early version of [PokemonGo-Map](https://github.com/AHAAAAAAA/PokemonGo-Map), but no longer shares any code with it. It uses my [pogo_async](https://github.com/Noctem/pgoapi), my fork of pgoapi which uses *aiohttp* for asynchronous network requests.
+This project is based on the coroutines branch of [pokeminer](https://github.com/modrzew/pokeminer/tree/coroutines) (now discontinued). *Pokeminer* was originally based on an early version of [PokemonGo-Map](https://github.com/AHAAAAAAA/PokemonGo-Map), but no longer shares any code with it. It uses [aiopogo](https://github.com/Noctem/aiopogo), my fork of pgoapi which uses *aiohttp* for asynchronous network requests.
 
 The [excellent image](https://darkestnight.deviantart.com/art/A-Distinguished-Pokeman-208009200) near the top of this README was painted by [darkestnight](https://darkestnight.deviantart.com/).
