@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 
 from multiprocessing.managers import BaseManager
+from aiopogo import PGoApi, close_sessions, exceptions as ex
+from aiopogo.auth_ptc import AuthPtc
 from asyncio import get_event_loop, sleep
 from random import uniform
-from time import time
-
 from selenium import webdriver
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
-from aiopogo import PGoApi, close_sessions, activate_hash_server, exceptions as ex
-from aiopogo.auth_ptc import AuthPtc
+from time import time
+
+import socket
 
 from monocle import sanitized as conf
 from monocle.utils import random_altitude, get_device_info, get_address, LAT_MEAN, LON_MEAN
@@ -54,12 +55,10 @@ async def main():
         class AccountManager(BaseManager): pass
         AccountManager.register('captcha_queue')
         AccountManager.register('extra_queue')
-        manager = AccountManager(address=get_address(), authkey=conf.AUTHKEY)
+        manager = AccountManager(address=get_address(), authkey=conf.authkey)
         manager.connect()
         captcha_queue = manager.captcha_queue()
         extra_queue = manager.extra_queue()
-
-        activate_hash_server(conf.HASH_KEY)
 
         driver = webdriver.Chrome()
         driver.set_window_size(803, 807)
@@ -76,13 +75,15 @@ async def main():
                 except IndexError:
                     alt = random_altitude()
             else:
-                lat = uniform(LAT_MEAN - 0.0001, LAT_MEAN + 0.0001)
-                lon = uniform(LON_MEAN - 0.0001, LON_MEAN + 0.0001)
+                lat = uniform(LAT_MEAN - 0.001, LAT_MEAN + 0.001)
+                lon = uniform(LON_MEAN - 0.001, LON_MEAN + 0.001)
                 alt = random_altitude()
 
             try:
                 device_info = get_device_info(account)
                 api = PGoApi(device_info=device_info)
+                if conf.HASH_KEY:
+                    api.activate_hash_server(HASH_KEY)
                 api.set_position(lat, lon, alt)
 
                 authenticated = False
@@ -101,11 +102,7 @@ async def main():
                                                  provider=account.get('provider', 'ptc'))
 
                 request = api.create_request()
-                await request.call()
-
-                await sleep(.6)
-
-                request.download_remote_config_version(platform=1, app_version=5704)
+                request.download_remote_config_version(platform=1, app_version=5703)
                 request.check_challenge()
                 request.get_hatched_eggs()
                 request.get_inventory()
@@ -113,6 +110,10 @@ async def main():
                 request.download_settings()
                 response = await request.call()
                 account['time'] = time()
+
+                if response['status_code'] == 3:
+                    print('{} appears to be banned.'.format(username))
+                    continue
 
                 responses = response['responses']
                 challenge_url = responses['CHECK_CHALLENGE']['challenge_url']

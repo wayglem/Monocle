@@ -6,6 +6,8 @@ from pkg_resources import resource_stream
 from tempfile import TemporaryFile
 from asyncio import gather, TimeoutError
 
+import json
+
 from aiohttp import ClientError, DisconnectedError, HttpProcessingError
 
 from .utils import load_pickle, dump_pickle
@@ -50,14 +52,6 @@ if conf.NOTIFY:
         PUSHBULLET=True
 
     if conf.WEBHOOKS:
-        try:
-            import ujson as json
-            jargs = {'double_precision': 17}
-        except ImportError:
-            import json
-            jargs = {}
-
-        HEADERS = {'content-type': 'application/json'}
         if len(conf.WEBHOOKS) == 1:
             HOOK_POINT = next(iter(conf.WEBHOOKS))
             WEBHOOK = 1
@@ -799,7 +793,7 @@ class Notifier:
         except KeyError:
             pass
 
-        payload = json.dumps(data, **jargs)
+        payload = json.dumps(data)
         session = SessionManager.get()
         return await self.wh_send(session, payload)
 
@@ -813,7 +807,7 @@ class Notifier:
 
     async def hook_post(self, w, session, payload):
         try:
-            async with session.post(w, data=payload, timeout=3, headers=HEADERS) as resp:
+            async with session.post(w, data=payload, timeout=3) as resp:
                 resp.raise_for_status()
                 return True
         except HttpProcessingError as e:
@@ -826,8 +820,6 @@ class Notifier:
             err = e.__cause__ or e
             self.log.error('{} on webhook: {}', err.__class__.__name__, w)
             return False
-        except CancelledError:
-            raise
         except Exception:
             self.log.exception('Error from webhook: {}', w)
             return False

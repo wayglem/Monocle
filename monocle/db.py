@@ -8,8 +8,7 @@ import time
 from sqlalchemy import Column, Integer, String, Float, SmallInteger, BigInteger, ForeignKey, UniqueConstraint, create_engine, cast, func, desc, asc, and_, exists
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.types import TypeDecorator, Numeric, Text
-from sqlalchemy.dialects.mysql import TINYINT, MEDIUMINT, BIGINT, DOUBLE
-from sqlalchemy.dialects.postgresql import DOUBLE_PRECISION
+from sqlalchemy.dialects.mysql import TINYINT, MEDIUMINT, BIGINT
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm.exc import NoResultFound
 
@@ -43,7 +42,6 @@ if conf.DB_ENGINE.startswith('mysql'):
     TINY_TYPE = TINYINT(unsigned=True)          # 0 to 255
     MEDIUM_TYPE = MEDIUMINT(unsigned=True)      # 0 to 4294967295
     HUGE_TYPE = BIGINT(unsigned=True)           # 0 to 18446744073709551615
-    FLOAT_TYPE = DOUBLE(precision=17, scale=14, asdecimal=False)
 elif conf.DB_ENGINE.startswith('postgres'):
     class NumInt(TypeDecorator):
         '''Modify Numeric type for integers'''
@@ -62,7 +60,6 @@ elif conf.DB_ENGINE.startswith('postgres'):
     TINY_TYPE = SmallInteger                    # -32768 to 32767
     MEDIUM_TYPE = Integer                       # -2147483648 to 2147483647
     HUGE_TYPE = NumInt(precision=20, scale=0)   # up to 20 digits
-    FLOAT_TYPE = DOUBLE_PRECISION(asdecimal=False)
 else:
     class TextInt(TypeDecorator):
         '''Modify Text type for integers'''
@@ -77,7 +74,6 @@ else:
     TINY_TYPE = SmallInteger
     MEDIUM_TYPE = Integer
     HUGE_TYPE = TextInt
-    FLOAT_TYPE = Float(asdecimal=False)
 
 if conf.SPAWN_ID_INT:
     ID_TYPE = BigInteger
@@ -232,8 +228,8 @@ class Sighting(Base):
     spawn_id = Column(ID_TYPE)
     expire_timestamp = Column(Integer, index=True)
     encounter_id = Column(HUGE_TYPE, index=True)
-    lat = Column(FLOAT_TYPE)
-    lon = Column(FLOAT_TYPE)
+    lat = Column(Float)
+    lon = Column(Float)
     atk_iv = Column(TINY_TYPE)
     def_iv = Column(TINY_TYPE)
     sta_iv = Column(TINY_TYPE)
@@ -256,8 +252,8 @@ class Mystery(Base):
     pokemon_id = Column(TINY_TYPE)
     spawn_id = Column(ID_TYPE, index=True)
     encounter_id = Column(HUGE_TYPE, index=True)
-    lat = Column(FLOAT_TYPE)
-    lon = Column(FLOAT_TYPE)
+    lat = Column(Float)
+    lon = Column(Float)
     first_seen = Column(Integer, index=True)
     first_seconds = Column(SmallInteger)
     last_seconds = Column(SmallInteger)
@@ -283,8 +279,8 @@ class Spawnpoint(Base):
     id = Column(Integer, primary_key=True)
     spawn_id = Column(ID_TYPE, unique=True, index=True)
     despawn_time = Column(SmallInteger, index=True)
-    lat = Column(FLOAT_TYPE)
-    lon = Column(FLOAT_TYPE)
+    lat = Column(Float)
+    lon = Column(Float)
     alt = Column(SmallInteger)
     updated = Column(Integer, index=True)
     duration = Column(TINY_TYPE)
@@ -295,8 +291,8 @@ class Fort(Base):
 
     id = Column(Integer, primary_key=True)
     external_id = Column(String(35), unique=True)
-    lat = Column(FLOAT_TYPE)
-    lon = Column(FLOAT_TYPE)
+    lat = Column(Float)
+    lon = Column(Float)
 
     sightings = relationship(
         'FortSighting',
@@ -329,8 +325,8 @@ class Pokestop(Base):
 
     id = Column(Integer, primary_key=True)
     external_id = Column(String(35), unique=True)
-    lat = Column(FLOAT_TYPE, index=True)
-    lon = Column(FLOAT_TYPE, index=True)
+    lat = Column(Float, index=True)
+    lon = Column(Float, index=True)
 
 
 Session = sessionmaker(bind=get_engine())
@@ -601,14 +597,11 @@ def update_mystery(session, mystery):
 
 
 def get_sightings(session, after_id=0):
-    q = session.query(Sighting) \
+    return session.query(Sighting) \
         .filter(and_( \
             Sighting.expire_timestamp > time.time(), \
             Sighting.id > after_id \
-        ))
-    if conf.MAP_FILTER_IDS:
-        q = q.filter(~Sighting.pokemon_id.in_(conf.MAP_FILTER_IDS))
-    return q.all()
+        )).all()
 
 
 def get_spawn_points(session):
