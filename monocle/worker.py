@@ -1,33 +1,49 @@
 from asyncio import sleep, Lock, Semaphore, gather
 from random import choice, randint, uniform, triangular
 from time import time, monotonic
+from array import typecodes
 from queue import Empty
-from itertools import cycle
-from sys import exit
-from concurrent.futures import CancelledError
 
 from aiopogo import PGoApi, exceptions as ex
 from aiopogo.auth_ptc import AuthPtc
+from aiopogo.utilities import get_cell_ids, HAVE_POGEO
 from aiopogo.hash_server import HashServer
-from pogeo import get_distance
 
 from .db import SIGHTING_CACHE, MYSTERY_CACHE, Bounds
-from .utils import round_coords, load_pickle, get_device_info, get_spawn_id, get_start_coords, Units, randomize_point
+from .utils import round_coords, load_pickle, get_device_info, get_spawn_id, get_distance, get_start_coords, Units, randomize_point
 from .shared import get_logger, LOOP, SessionManager, run_threaded, ACCOUNTS
 from .spawns import SPAWNS
 from .db_proc import DB_PROC
-from . import avatar, sanitized as conf
+from . import config, avatar
 
-if conf.NOTIFY:
+try:
+    import _thread
+except ImportError as e:
+    if config.FORCED_KILL:
+        raise OSError('Your platform does not support _thread so FORCED_KILL will not work.') from e
+    import _dummy_thread as _thread
+
+if config.NOTIFY:
     from .notification import Notifier
 
-if conf.CACHE_CELLS:
-    from aiopogo.utilities import get_cell_ids
-    from array import typecodes
+if config.CONTROL_SOCKS:
+    from stem import Signal
+    from stem.control import Controller
+    import stem.util.log
+    stem.util.log.get_logger().level = 40
+    CIRCUIT_TIME = dict()
+    CIRCUIT_FAILURES = dict()
+    for proxy in config.PROXIES:
+        CIRCUIT_TIME[proxy] = monotonic()
+        CIRCUIT_FAILURES[proxy] = 0
 else:
-    from pogeo import get_cell_ids
+    CIRCUIT_TIME = None
+    CIRCUIT_FAILURES = None
 
-_unit = getattr(Units, conf.SPEED_UNIT.lower())
+if not hasattr(config, 'CACHE_CELLS'):
+    config.CACHE_CELLS = not HAVE_POGEO
+
+_unit = getattr(Units, config.SPEED_UNIT.lower())
 if _unit is Units.miles:
     SPINNING_SPEED_LIMIT = 21
     UNIT_STRING = "MPH"
@@ -39,8 +55,6 @@ elif _unit is Units.meters:
     UNIT_STRING = "m/h"
 _UNIT = _unit.value
 
-VERSIONS = ('0.57.4', '0.57.3', '0.57.2', '0.55.0')
-
 
 class Worker:
     """Single worker walking on the map"""
@@ -48,22 +62,22 @@ class Worker:
     download_hash = "7b9c5056799a2c5c7d48a62c497736cbcf8c4acb"
     g = {'seen': 0, 'captchas': 0}
 
-    if conf.CACHE_CELLS:
+    if config.CACHE_CELLS:
         cell_ids = load_pickle('cells') or {}
         COMPACT = 'Q' in typecodes
 
-    login_semaphore = Semaphore(conf.SIMULTANEOUS_LOGINS, loop=LOOP)
-    sim_semaphore = Semaphore(conf.SIMULTANEOUS_SIMULATION, loop=LOOP)
+    login_semaphore = Semaphore(config.SIMULTANEOUS_LOGINS, loop=LOOP)
+    sim_semaphore = Semaphore(config.SIMULTANEOUS_SIMULATION, loop=LOOP)
 
-    MULTIPROXY = False
-    if conf.PROXIES:
-        if len(conf.PROXIES) > 1:
-            MULTIPROXY = True
-        proxies = cycle(conf.PROXIES)
-    else:
-        proxies = None
+    proxies = None
+    proxy = None
+    if config.PROXIES:
+        if len(config.PROXIES) == 1:
+            proxy = config.PROXIES.pop()
+        else:
+            proxies = config.PROXIES.copy()
 
-    if conf.NOTIFY:
+    if config.NOTIFY:
         notifier = Notifier()
 
     def __init__(self, worker_no):
@@ -95,6 +109,9 @@ class Worker:
         self.num_captchas = 0
         self.eggs = {}
         self.unused_incubators = []
+        # API setup
+        if self.proxies:
+            self.new_proxy(set_api=False)
         self.initialize_api()
         # State variables
         self.busy = Lock(loop=LOOP)
@@ -105,7 +122,7 @@ class Worker:
         self.error_code = 'INIT'
         self.item_capacity = 350
         self.visits = 0
-        self.pokestops = conf.SPIN_POKESTOPS
+        self.pokestops = config.SPIN_POKESTOPS
         self.next_spin = 0
         self.handle = HandleStub()
 
@@ -115,12 +132,14 @@ class Worker:
         self.account_seen = 0
 
         self.api = PGoApi(device_info=device_info)
+        if config.HASH_KEY:
+            self.api.activate_hash_server(config.HASH_KEY)
         self.api.set_position(*self.location, self.altitude)
-        if self.proxies:
-            self.api.set_proxy(next(self.proxies))
+        if self.proxy:
+            self.api.set_proxy(self.proxy)
         try:
             if self.account['provider'] == 'ptc' and 'auth' in self.account:
-                self.api._auth_provider = AuthPtc(username=self.username, password=self.account['password'], timeout=conf.LOGIN_TIMEOUT)
+                self.api._auth_provider = AuthPtc(username=self.username, password=self.account['password'], timeout=config.LOGIN_TIMEOUT)
                 self.api._auth_provider._access_token = self.account['auth']
                 self.api._auth_provider.set_refresh_token(self.account['refresh'])
                 self.api._auth_provider._access_token_expiry = self.account['expiry']
@@ -129,16 +148,32 @@ class Worker:
         except KeyError:
             pass
 
-    def swap_proxy(self):
-        proxy = self.api.proxy
-        while proxy == self.api.proxy:
-            self.api.set_proxy(next(self.proxies))
+    def new_proxy(self, set_api=True):
+        self.proxy = self.proxies.pop()
+        if not self.proxies:
+            self.proxies.update(config.PROXIES)
+        if set_api:
+            self.api.set_proxy(self.proxy)
+
+    def swap_circuit(self, reason=''):
+        time_passed = monotonic() - CIRCUIT_TIME[self.proxy]
+        if time_passed > 180:
+            socket = config.CONTROL_SOCKS[self.proxy]
+            with Controller.from_socket_file(path=socket) as controller:
+                controller.authenticate()
+                controller.signal(Signal.NEWNYM)
+            CIRCUIT_TIME[self.proxy] = monotonic()
+            CIRCUIT_FAILURES[self.proxy] = 0
+            self.log.warning('Changed circuit on {} due to {}.', self.proxy, reason)
+        else:
+            self.log.info('Skipped changing circuit on {} because it was '
+                          'changed {} seconds ago.', self.proxy, time_passed)
 
     async def login(self, reauth=False):
         """Logs worker in and prepares for scanning"""
         self.log.info('Trying to log in')
 
-        for attempt in range(-1, conf.MAX_RETRIES):
+        for attempt in range(-1, config.MAX_RETRIES):
             try:
                 self.error_code = '»'
                 async with self.login_semaphore:
@@ -146,8 +181,8 @@ class Worker:
                     await self.api.set_authentication(
                         username=self.username,
                         password=self.account['password'],
-                        provider=self.account.get('provider') or 'ptc',
-                        timeout=conf.LOGIN_TIMEOUT
+                        provider=self.account.get('provider', 'ptc'),
+                        timeout=config.LOGIN_TIMEOUT
                     )
             except (ex.AuthTimeoutException, ex.AuthConnectionException) as e:
                 err = e
@@ -166,10 +201,10 @@ class Worker:
             raise err
 
         self.error_code = '°'
-        version = 5704
+        version = 5703
         async with self.sim_semaphore:
             self.error_code = 'APP SIMULATION'
-            if conf.APP_SIMULATION:
+            if config.APP_SIMULATION:
                 await self.app_simulation_login(version)
             else:
                 await self.download_remote_config(version)
@@ -179,7 +214,7 @@ class Worker:
 
     async def get_player(self):
         request = self.api.create_request()
-        request.get_player(player_locale=conf.PLAYER_LOCALE)
+        request.get_player(player_locale=config.PLAYER_LOCALE)
 
         responses = await self.call(request, chain=False)
 
@@ -263,7 +298,7 @@ class Worker:
 
         await self.random_sleep(.87, 2)
 
-        if (conf.COMPLETE_TUTORIAL and
+        if (config.COMPLETE_TUTORIAL and
                 tutorial_state is not None and
                 not all(x in tutorial_state for x in (0, 1, 3, 4, 7))):
             try:
@@ -316,7 +351,7 @@ class Worker:
             await self.random_sleep(.35, .525)
 
             request = self.api.create_request()
-            request.get_player(player_locale=conf.PLAYER_LOCALE)
+            request.get_player(player_locale=config.PLAYER_LOCALE)
             await self.call(request, buddy=False)
             await sleep(1)
 
@@ -340,7 +375,7 @@ class Worker:
 
             await self.random_sleep(.4, .5)
             request = self.api.create_request()
-            request.get_player(player_locale=conf.PLAYER_LOCALE)
+            request.get_player(player_locale=config.PLAYER_LOCALE)
             responses = await self.call(request)
 
             try:
@@ -362,7 +397,7 @@ class Worker:
 
             await sleep(.7, loop=LOOP)
             request = self.api.create_request()
-            request.get_player(player_locale=conf.PLAYER_LOCALE)
+            request.get_player(player_locale=config.PLAYER_LOCALE)
             await self.call(request)
             await sleep(.13, loop=LOOP)
 
@@ -394,7 +429,7 @@ class Worker:
                 item = obj['item']
                 item_id = item.get('item_id')
                 self.items[item_id] = item.get('count', 0)
-            elif conf.INCUBATE_EGGS:
+            elif config.INCUBATE_EGGS:
                 if ('pokemon_data' in obj and
                         obj['pokemon_data'].get('is_egg')):
                     egg = obj['pokemon_data']
@@ -427,8 +462,19 @@ class Worker:
             if buddy:
                 request.get_buddy_walked()
 
+        try:
+            refresh = HashServer.status.get('period')
+
+            while HashServer.status.get('remaining') < 5 and time() < refresh:
+                self.error_code = 'HASH WAITING'
+                wait = refresh - time() + 1
+                await sleep(wait, loop=LOOP)
+                refresh = HashServer.status.get('period')
+        except TypeError:
+            pass
+
+        now = time()
         if action:
-            now = time()
             # wait for the time required, or at least a half-second
             if self.last_action > now + .5:
                 await sleep(self.last_action - now, loop=LOOP)
@@ -437,7 +483,7 @@ class Worker:
 
         response = None
         err = None
-        for attempt in range(-1, conf.MAX_RETRIES):
+        for attempt in range(-1, config.MAX_RETRIES):
             try:
                 response = await request.call()
                 try:
@@ -503,9 +549,11 @@ class Worker:
                     err = e
                 self.error_code = 'PROXY ERROR'
 
-                if self.MULTIPROXY:
+                if self.proxies:
                     self.log.error('{}, swapping proxy.', e)
-                    self.swap_proxy()
+                    proxy = self.proxy
+                    while proxy == self.proxy:
+                        self.new_proxy()
                 else:
                     if err != e:
                         self.log.error('{}', e)
@@ -536,18 +584,18 @@ class Worker:
         if settings:
             try:
                 dl_settings = responses['DOWNLOAD_SETTINGS']
-                Worker.download_hash = dl_settings['hash']
+                self.download_hash = dl_settings['hash']
             except KeyError:
                 self.log.info('Missing DOWNLOAD_SETTINGS response.')
             else:
                 try:
                     if (not dl_hash
-                            and conf.FORCED_KILL
-                            and dl_settings['settings']['minimum_client_version'] not in VERSIONS):
+                            and config.FORCED_KILL
+                            and dl_settings['settings']['minimum_client_version'] not in config.FORCED_KILL):
                         err = 'A new version is being forced, exiting.'
                         self.log.error(err)
                         print(err)
-                        exit()
+                        _thread.interrupt_main()
                 except KeyError:
                     pass
         if self.check_captcha(responses):
@@ -558,7 +606,7 @@ class Worker:
 
     def travel_speed(self, point):
         '''Fast calculation of travel speed to point'''
-        time_diff = max(time() - self.last_request, conf.SCAN_DELAY)
+        time_diff = max(time() - self.last_request, config.SCAN_DELAY)
         distance = get_distance(self.location, point, _UNIT)
         # conversion from seconds to hours
         speed = (distance / time_diff) * 3600
@@ -618,19 +666,28 @@ class Worker:
         except ex.ProxyException as e:
             self.error_code = 'PROXY ERROR'
 
-            if self.MULTIPROXY:
+            if self.proxies:
                 self.log.error('{} Swapping proxy.', e)
-                self.swap_proxy()
+                proxy = self.proxy
+                while proxy == self.proxy:
+                    self.new_proxy()
             else:
                 self.log.error('{}', e)
+            await sleep(5, loop=LOOP)
         except ex.TimeoutException as e:
             self.log.warning('{} Giving up.', e)
         except ex.NianticIPBannedException:
             self.error_code = 'IP BANNED'
 
-            if self.MULTIPROXY:
-                self.log.warning('Swapping out {} due to IP ban.', self.api.proxy)
-                self.swap_proxy()
+            if config.CONTROL_SOCKS:
+                self.swap_circuit('IP ban')
+                await self.random_sleep(25, 35)
+            elif self.proxies:
+                self.log.warning('Swapping out {} due to IP ban.', self.proxy)
+                proxy = self.proxy
+                while proxy == self.proxy:
+                    self.new_proxy()
+                await self.random_sleep(12, 20)
             else:
                 self.log.error('IP banned.')
         except ex.ServerBusyOrOfflineException as e:
@@ -643,10 +700,10 @@ class Worker:
             self.log.warning('{} Giving up.', e)
         except ex.ExpiredHashKeyException:
             self.error_code = 'KEY EXPIRED'
-            err = 'Hash key has expired: {}'.format(conf.HASH_KEY)
+            err = 'Hash key has expired: {}'.format(config.HASH_KEY)
             self.log.error(err)
             print(err)
-            exit()
+            _thread.interrupt_main()
         except (ex.MalformedResponseException, ex.UnexpectedResponseException) as e:
             self.log.warning('{} Giving up.', e)
             self.error_code = 'MALFORMED RESPONSE'
@@ -659,8 +716,6 @@ class Worker:
         except ex.AiopogoError as e:
             self.log.exception(e.__class__.__name__)
             self.error_code = 'AIOPOGO ERROR'
-        except CancelledError:
-            self.log.warning('Visit cancelled.')
         except Exception as e:
             self.log.exception('A wild {} appeared!', e.__class__.__name__)
             self.error_code = 'EXCEPTION'
@@ -676,7 +731,7 @@ class Worker:
         self.log.info('Visiting {0[0]:.4f},{0[1]:.4f}', point)
         start = time()
 
-        if conf.CACHE_CELLS:
+        if config.CACHE_CELLS:
             rounded = round_coords(point, 4)
             try:
                 cell_ids = self.cell_ids[rounded]
@@ -684,7 +739,7 @@ class Worker:
                 cell_ids = get_cell_ids(*rounded, compact=self.COMPACT)
                 self.cell_ids[rounded] = cell_ids
         else:
-            cell_ids = get_cell_ids(latitude, longitude, 500)
+            cell_ids = get_cell_ids(latitude, longitude)
 
         since_timestamp_ms = (0,) * len(cell_ids)
 
@@ -694,7 +749,7 @@ class Worker:
                                 latitude=latitude,
                                 longitude=longitude)
 
-        diff = self.last_gmo + conf.SCAN_DELAY - time()
+        diff = self.last_gmo + config.SCAN_DELAY - time()
         if diff > 0:
             await sleep(diff, loop=LOOP)
         responses = await self.call(request)
@@ -720,14 +775,14 @@ class Worker:
         forts_seen = 0
         points_seen = 0
 
-        if conf.NOTIFY:
+        if config.NOTIFY:
             try:
                 time_of_day = map_objects['time_of_day']
             except KeyError:
                 self.empty_visits += 1
                 raise EmptyGMOException
 
-        if conf.ITEM_LIMITS and self.bag_full():
+        if config.ITEM_LIMITS and self.bag_full():
             await self.clean_bag()
 
         for map_cell in map_objects['map_cells']:
@@ -737,13 +792,10 @@ class Worker:
 
                 normalized = self.normalize_pokemon(pokemon)
 
-                if conf.NOTIFY and self.notifier.eligible(normalized):
-                    if conf.ENCOUNTER:
+                if config.NOTIFY and self.notifier.eligible(normalized):
+                    if config.ENCOUNTER:
                         try:
                             await self.encounter(normalized)
-                        except CancelledError:
-                            DB_PROC.add(normalized)
-                            raise
                         except Exception as e:
                             self.log.warning('{} during encounter', e.__class__.__name__)
                     LOOP.create_task(self.notifier.notify(normalized, time_of_day))
@@ -751,7 +803,7 @@ class Worker:
                 if (normalized not in SIGHTING_CACHE and
                         normalized not in MYSTERY_CACHE):
                     self.account_seen += 1
-                    if (conf.ENCOUNTER == 'all' and
+                    if (config.ENCOUNTER == 'all' and
                             'individual_attack' not in normalized):
                         try:
                             await self.encounter(normalized)
@@ -782,7 +834,7 @@ class Worker:
                 else:
                     DB_PROC.add(self.normalize_gym(fort))
 
-            if conf.MORE_POINTS or bootstrap:
+            if config.MORE_POINTS or bootstrap:
                 for point in map_cell.get('spawn_points', []):
                     points_seen += 1
                     try:
@@ -794,8 +846,8 @@ class Worker:
                         self.log.warning('Spawn point exception ignored. {}', point)
                         pass
 
-        if (conf.INCUBATE_EGGS and self.unused_incubators
-                and self.eggs and self.smart_throttle()):
+        if (config.INCUBATE_EGGS and len(self.unused_incubators) > 0
+                and len(self.eggs) > 0 and self.smart_throttle()):
             await self.incubate_eggs()
 
         if pokemon_seen > 0:
@@ -803,6 +855,8 @@ class Worker:
             self.total_seen += pokemon_seen
             self.g['seen'] += pokemon_seen
             self.empty_visits = 0
+            if CIRCUIT_FAILURES:
+                CIRCUIT_FAILURES[self.proxy] = 0
         else:
             self.empty_visits += 1
             if forts_seen == 0:
@@ -813,9 +867,15 @@ class Worker:
             if self.empty_visits > 3:
                 reason = '{} empty visits'.format(self.empty_visits)
                 await self.swap_account(reason)
+            if CIRCUIT_FAILURES:
+                CIRCUIT_FAILURES[self.proxy] += 1
+                if CIRCUIT_FAILURES[self.proxy] > 20:
+                    reason = '{} empty visits'.format(
+                        CIRCUIT_FAILURES[self.proxy])
+                    self.swap_circuit(reason)
         self.visits += 1
 
-        if conf.MAP_WORKERS:
+        if config.MAP_WORKERS:
             self.worker_dict.update([(self.worker_no,
                 ((latitude, longitude), start, self.speed, self.total_seen,
                 self.visits, pokemon_seen))])
@@ -833,13 +893,13 @@ class Worker:
         return pokemon_seen + forts_seen + points_seen
 
     def smart_throttle(self, requests=1):
-        if not conf.SMART_THROTTLE:
+        if not config.SMART_THROTTLE:
             return True
 
         try:
             # https://en.wikipedia.org/wiki/Linear_equation#Two_variables
             # e.g. hashes_left > 2.25*seconds_left+7.5, spare = 0.05, max = 150
-            spare = conf.SMART_THROTTLE * HashServer.status['maximum']
+            spare = config.SMART_THROTTLE * HashServer.status['maximum']
             hashes_left = HashServer.status['remaining'] - requests
             usable_per_second = (HashServer.status['maximum'] - spare) / 60
             seconds_left = HashServer.status['period'] - time()
@@ -892,7 +952,7 @@ class Worker:
         else:
             self.log.warning('Failed spinning {}: {}', name, result)
 
-        self.next_spin = time() + conf.SPIN_COOLDOWN
+        self.next_spin = time() + config.SPIN_COOLDOWN
         self.error_code = '!'
         return responses
 
@@ -951,7 +1011,7 @@ class Worker:
     async def clean_bag(self):
         self.error_code = '|'
         rec_items = {}
-        limits = conf.ITEM_LIMITS
+        limits = config.ITEM_LIMITS
         for item, count in self.items.items():
             if item in limits and count > limits[item]:
                 discard = count - limits[item]
@@ -997,7 +1057,7 @@ class Worker:
                         inc.get('id', 0), egg.get('id', 0), ret)
 
     async def handle_captcha(self, responses):
-        if self.num_captchas >= conf.CAPTCHAS_ALLOWED:
+        if self.num_captchas >= config.CAPTCHAS_ALLOWED:
             self.log.error("{} encountered too many CAPTCHAs, removing.", self.username)
             raise CaptchaException
 
@@ -1007,7 +1067,7 @@ class Worker:
         session = SessionManager.get()
         try:
             params = {
-                'key': conf.CAPTCHA_KEY,
+                'key': config.CAPTCHA_KEY,
                 'method': 'userrecaptcha',
                 'googlekey': '6LeeTScTAAAAADqvhqVMhPpr_vB9D364Ia-1dSgK',
                 'pageurl': responses.get('CHECK_CHALLENGE', {}).get('challenge_url'),
@@ -1015,8 +1075,6 @@ class Worker:
             }
             async with session.post('http://2captcha.com/in.php', params=params, timeout=10) as resp:
                 response = await resp.json()
-        except CancelledError:
-            raise
         except Exception as e:
             self.log.error('Got an error while trying to solve CAPTCHA. '
                            'Check your API Key and account balance.')
@@ -1025,7 +1083,7 @@ class Worker:
         code = response.get('request')
         if response.get('status') != 1:
             if code in ('ERROR_WRONG_USER_KEY', 'ERROR_KEY_DOES_NOT_EXIST', 'ERROR_ZERO_BALANCE'):
-                conf.CAPTCHA_KEY = None
+                config.CAPTCHA_KEY = None
                 self.log.error('2Captcha reported: {}, disabling CAPTCHA solving', code)
             else:
                 self.log.error("Failed to submit CAPTCHA for solving: {}", code)
@@ -1034,7 +1092,7 @@ class Worker:
         try:
             # Get the response, retry every 5 seconds if it's not ready
             params = {
-                'key': conf.CAPTCHA_KEY,
+                'key': config.CAPTCHA_KEY,
                 'action': 'get',
                 'id': code,
                 'json': 1
@@ -1045,8 +1103,6 @@ class Worker:
                 if response.get('request') != 'CAPCHA_NOT_READY':
                     break
                 await sleep(5, loop=LOOP)
-        except CancelledError:
-            raise
         except Exception as e:
             self.log.error('Got an error while trying to solve CAPTCHA. '
                               'Check your API Key and account balance.')
@@ -1065,7 +1121,7 @@ class Worker:
             self.log.warning("Successfully solved CAPTCHA")
         except CaptchaException:
             self.log.warning("CAPTCHA #{} for {} was not solved correctly, trying again",
-                code, self.username)
+                captcha_id, self.username)
             # try again
             await self.handle_captcha(responses)
 
@@ -1110,7 +1166,7 @@ class Worker:
     async def lock_and_swap(self, minutes):
         async with self.busy:
             self.error_code = 'SWAPPING'
-            h, m = divmod(int(minutes), 60)
+            h, m = divmod(int(minutes), 3600)
             if h:
                 timestr = '{}h{}m'.format(h, m)
             else:
@@ -1128,8 +1184,8 @@ class Worker:
         await self.new_account()
 
     async def new_account(self):
-        if (conf.CAPTCHA_KEY
-                and (conf.FAVOR_CAPTCHA or self.extra_queue.empty())
+        if (config.CAPTCHA_KEY
+                and (config.FAVOR_CAPTCHA or self.extra_queue.empty())
                 and not self.captcha_queue.empty()):
             self.account = self.captcha_queue.get()
         else:
@@ -1188,7 +1244,10 @@ class Worker:
 
     @staticmethod
     def normalize_lured(raw, now):
-        spawn_id = -1 if conf.SPAWN_ID_INT else 'LURED'
+        if config.SPAWN_ID_INT:
+            spawn_id = -1
+        else:
+            spawn_id = 'LURED'
         return {
             'type': 'pokemon',
             'encounter_id': raw['lure_info']['encounter_id'],
@@ -1231,7 +1290,7 @@ class Worker:
             return False
         else:
             if challenge_url != ' ':
-                if conf.CAPTCHA_KEY:
+                if config.CAPTCHA_KEY:
                     return True
                 raise CaptchaException
             return False

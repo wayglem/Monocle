@@ -14,12 +14,17 @@ from sqlalchemy.exc import OperationalError
 
 import time
 
+try:
+    import _thread
+except ImportError:
+    import _dummy_thread as _thread
+
 from .db import SIGHTING_CACHE, MYSTERY_CACHE
 from .utils import get_current_hour, dump_pickle, get_start_coords, get_bootstrap_points, randomize_point
 from .shared import get_logger, LOOP, run_threaded, ACCOUNTS
 from .db_proc import DB_PROC
 from .spawns import SPAWNS
-from . import sanitized as conf
+from . import config
 from .worker import Worker
 
 BAD_STATUSES = (
@@ -48,35 +53,31 @@ START_TIME = time.monotonic()
 
 
 class Overseer:
-    def __init__(self, manager):
+    def __init__(self, status_bar, manager):
         self.log = get_logger('overseer')
         self.workers = []
         self.manager = manager
-        self.count = conf.GRID[0] * conf.GRID[1]
+        self.count = config.GRID[0] * config.GRID[1]
         self.start_date = datetime.now()
-        self.things_count = deque(maxlen=9)
+        self.status_bar = status_bar
+        self.things_count = []
         self.paused = False
         self.coroutines_count = 0
         self.skipped = 0
         self.visits = 0
         self.mysteries = deque()
-        self.coroutine_semaphore = asyncio.Semaphore(conf.COROUTINES_LIMIT, loop=LOOP)
+        self.coroutine_semaphore = asyncio.Semaphore(config.COROUTINES_LIMIT, loop=LOOP)
         self.redundant = 0
-        self.running = True
         self.all_seen = False
         self.idle_seconds = 0
-        if platform == 'win32':
-            self.clear = 'cls'
-        else:
-            self.clear = 'clear'
         self.log.info('Overseer initialized')
 
-    def start(self, status_bar):
+    def start(self):
         self.captcha_queue = self.manager.captcha_queue()
         Worker.captcha_queue = self.manager.captcha_queue()
         self.extra_queue = self.manager.extra_queue()
         Worker.extra_queue = self.manager.extra_queue()
-        if conf.MAP_WORKERS:
+        if config.MAP_WORKERS:
             Worker.worker_dict = self.manager.worker_dict()
 
         for username, account in ACCOUNTS.items():
@@ -90,56 +91,50 @@ class Overseer:
 
         self.workers = tuple(Worker(worker_no=x) for x in range(self.count))
         DB_PROC.start()
-        LOOP.call_later(10, self.update_count)
-        LOOP.call_later(max(conf.SWAP_OLDEST, conf.MINIMUM_RUNTIME), self.swap_oldest)
-        LOOP.call_soon(self.update_stats)
-        if status_bar:
-            LOOP.call_soon(self.print_status)
 
-    def update_count(self):
-        self.things_count.append(str(DB_PROC.count))
-        LOOP.call_later(10, self.update_count)
+    async def check(self):
+        now = time.monotonic()
+        last_commit = now
+        last_things_found_updated = now
+        last_swap = now
+        last_stats_updated = 0
 
-    def swap_oldest(self):
-        if not self.paused and not self.extra_queue.empty():
-            oldest, minutes = self.longest_running()
-            if minutes > conf.MINIMUM_RUNTIME:
-                LOOP.create_task(oldest.lock_and_swap(minutes))
-        LOOP.call_later(conf.SWAP_OLDEST, self.swap_oldest)
-
-    def update_stats(self):
-        self.seen_stats, self.visit_stats, self.delay_stats, self.speed_stats = self.get_visit_stats()
-        self.update_coroutines_count()
-        LOOP.call_later(conf.STAT_REFRESH, self.update_stats)
-
-    def print_status(self):
-        try:
-            system(self.clear)
-            print(self.get_status_message())
-            if self.running:
-                LOOP.call_later(conf.REFRESH_RATE, self.print_status)
-        except CancelledError:
-            return
-        except Exception as e:
-            self.log.exception('{} occurred while printing status.', e.__class__.__name__)
-
-    async def exit_progress(self):
-        while self.coroutines_count > 2:
+        while True:
             try:
-                self.update_coroutines_count()
-                pending = DB_PROC.queue.qsize()
-                # Spaces at the end are important, as they clear previously printed
-                # output - \r doesn't clean whole line
-                print(
-                    '{} coroutines active, {} DB items pending   '.format(
-                        self.coroutines_count, pending),
-                    end='\r'
-                )
-                await asyncio.sleep(.5)
+                now = time.monotonic()
+                if now - last_commit > 5:
+                    DB_PROC.commit()
+                    last_commit = now
+                if now - last_swap > config.SWAP_OLDEST:
+                    if not self.paused and not self.extra_queue.empty():
+                        oldest, minutes = self.longest_running()
+                        if minutes > config.MINIMUM_RUNTIME:
+                            LOOP.create_task(oldest.lock_and_swap(minutes))
+                    last_swap = now
+                # Record things found count
+                if not self.paused and now - last_stats_updated > config.STAT_REFRESH:
+                    self.seen_stats, self.visit_stats, self.delay_stats, self.speed_stats = self.get_visit_stats()
+                    self.update_coroutines_count()
+                    last_stats_updated = now
+                if not self.paused and now - last_things_found_updated > 10:
+                    self.things_count = self.things_count[-9:]
+                    self.things_count.append(str(DB_PROC.count))
+                    last_things_found_updated = now
+                if self.status_bar:
+                    if platform == 'win32':
+                        system('cls')
+                    else:
+                        system('clear')
+                    print(self.get_status_message())
+
+                if self.paused:
+                    await asyncio.sleep(max(15, config.REFRESH_RATE), loop=LOOP)
+                else:
+                    await asyncio.sleep(config.REFRESH_RATE, loop=LOOP)
             except CancelledError:
                 return
             except Exception as e:
-                self.log.exception('A wild {} appeared in exit_progress!', e.__class__.__name__)
+                self.log.exception('A wild {} appeared in check!', e.__class__.__name__)
 
     @staticmethod
     def generate_stats(somelist):
@@ -194,6 +189,7 @@ class Overseer:
         A = simulating app startup
         T = completing the tutorial
         X = something bad happened
+        H = waiting for the next period on the hashing server
         C = CAPTCHA
 
         Other letters: various errors and procedures
@@ -202,7 +198,7 @@ class Overseer:
         messages = []
         row = []
         for i, worker in enumerate(self.workers):
-            if i > 0 and i % conf.GRID[1] == 0:
+            if i > 0 and i % config.GRID[1] == 0:
                 dots.append(row)
                 row = []
             if worker.error_code in BAD_STATUSES:
@@ -218,14 +214,10 @@ class Overseer:
 
     def update_coroutines_count(self):
         try:
-            tasks = asyncio.Task.all_tasks(LOOP)
-            if self.running:
-                self.coroutines_count = len(tasks)
-            else:
-                self.coroutines_count = sum(not t.done() for t in tasks)
+            self.coroutines_count = len(asyncio.Task.all_tasks(LOOP))
         except RuntimeError:
             # Set changed size during iteration
-            self.coroutines_count = '-1'
+            self.coroutines_count = '?'
 
     def get_status_message(self):
         running_for = datetime.now() - self.start_date
@@ -287,15 +279,15 @@ class Overseer:
         except ZeroDivisionError:
             pass
 
-        if conf.HASH_KEY:
+        if config.HASH_KEY:
             try:
-                refresh = HashServer.status['period'] - time.time()
+                refresh = HashServer.status.get('period') - time.time()
                 output.append('Hashes: {r}/{m}, refresh in {t:.0f}'.format(
-                    r=HashServer.status['remaining'],
-                    m=HashServer.status['maximum'],
+                    r=HashServer.status.get('remaining'),
+                    m=HashServer.status.get('maximum'),
                     t=refresh
                 ))
-            except (KeyError, TypeError):
+            except TypeError:
                 pass
 
         try:
@@ -365,7 +357,6 @@ class Overseer:
 
     async def _launch(self, bootstrap, pickle):
         initial = True
-        next_mystery_reload = 0
         while True:
             if not initial:
                 pickle = False
@@ -410,9 +401,9 @@ class Overseer:
                         continue
 
                 try:
-                    if self.captcha_queue.qsize() > conf.MAX_CAPTCHAS:
+                    if self.captcha_queue.qsize() > config.MAX_CAPTCHAS:
                         self.paused = True
-                        self.idle_seconds += await run_threaded(self.captcha_queue.full_wait, conf.MAX_CAPTCHAS)
+                        self.idle_seconds += await run_threaded(self.captcha_queue.full_wait, config.MAX_CAPTCHAS)
                         self.paused = False
                 except (EOFError, BrokenPipeError, FileNotFoundError):
                     continue
@@ -431,21 +422,16 @@ class Overseer:
                         await self.coroutine_semaphore.acquire()
                         LOOP.create_task(self.try_point(mystery_point))
                     except IndexError:
-                        if next_mystery_reload < time.monotonic():
-                            self.mysteries = SPAWNS.get_mysteries()
-                            next_mystery_reload = time.monotonic() + conf.RESCAN_UNKNOWN
-
+                        self.mysteries = SPAWNS.get_mysteries()
                         if not self.mysteries:
                             time_diff = time.time() - spawn_time
                             break
                     time_diff = time.time() - spawn_time
 
-                if time_diff < -1:
-                    await asyncio.sleep(time_diff * -1, loop=LOOP)
-                elif time_diff > 5 and spawn_id in SIGHTING_CACHE.store:
+                if time_diff > 5 and spawn_id in SIGHTING_CACHE.store:
                     self.redundant += 1
                     continue
-                elif time_diff > conf.SKIP_SPAWN:
+                elif time_diff > config.SKIP_SPAWN:
                     self.skipped += 1
                     continue
 
@@ -507,6 +493,9 @@ class Overseer:
                 return
             async with worker.busy:
                 if spawn_time:
+                    time_diff = spawn_time - time.time() + 1
+                    if time_diff > 0:
+                        await asyncio.sleep(time_diff, loop=LOOP)
                     worker.after_spawn = time.time() - spawn_time
 
                 if await worker.visit(point):
@@ -520,13 +509,13 @@ class Overseer:
 
     async def best_worker(self, point, spawn_time=None, must_visit=False):
         if spawn_time:
-            skip_time = max(time.monotonic() + conf.GIVE_UP_KNOWN, spawn_time)
+            skip_time = max(time.monotonic() + config.GIVE_UP_KNOWN, spawn_time)
         elif must_visit:
             skip_time = float('inf')
         else:
-            skip_time = time.monotonic() + conf.GIVE_UP_UNKNOWN
+            skip_time = time.monotonic() + config.GIVE_UP_UNKNOWN
 
-        while self.running:
+        while True:
             speed = None
             lowest_speed = float('inf')
             for w in (x for x in self.workers if not x.busy.locked()):
@@ -534,15 +523,15 @@ class Overseer:
                 if speed < lowest_speed:
                     lowest_speed = speed
                     worker = w
-                    if conf.GOOD_ENOUGH and speed < conf.GOOD_ENOUGH:
+                    if config.GOOD_ENOUGH and speed < config.GOOD_ENOUGH:
                         break
-            if lowest_speed < conf.SPEED_LIMIT:
+            if lowest_speed < config.SPEED_LIMIT:
                 worker.speed = lowest_speed
                 return worker
             if time.monotonic() > skip_time:
                 return None
             worker = None
-            await asyncio.sleep(conf.SEARCH_SLEEP, loop=LOOP)
+            await asyncio.sleep(config.SEARCH_SLEEP, loop=LOOP)
 
     def refresh_dict(self):
         while not self.extra_queue.empty():
