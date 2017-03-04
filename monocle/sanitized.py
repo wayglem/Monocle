@@ -49,7 +49,7 @@ _valid_types = {
     'GOOGLE_MAPS_KEY': str,
     'GRID': sequence,
     'HASHTAGS': set_sequence,
-    'HASH_KEY': (str,) + set_sequence,
+    'HASH_KEY': str,
     'HEATMAP': bool,
     'IGNORE_IVS': bool,
     'IGNORE_RARITY': bool,
@@ -66,7 +66,6 @@ _valid_types = {
     'LOGIN_TIMEOUT': Number,
     'MANAGER_ADDRESS': (str, tuple, list),
     'MAP_END': sequence,
-    'MAP_FILTER_IDS': sequence,
     'MAP_PROVIDER_ATTRIBUTION': str,
     'MAP_PROVIDER_URL': str,
     'MAP_START': sequence,
@@ -93,7 +92,6 @@ _valid_types = {
     'REFRESH_RATE': Number,
     'REPORT_MAPS': bool,
     'REPORT_SINCE': datetime,
-    'RESCAN_UNKNOWN': Number,
     'SCAN_DELAY': Number,
     'SEARCH_SLEEP': Number,
     'SHOW_TIMER': bool,
@@ -142,7 +140,7 @@ _defaults = {
     'COMPLETE_TUTORIAL': False,
     'CONTROL_SOCKS': None,
     'COROUTINES_LIMIT': worker_count,
-    'DIRECTORY': '.',
+    'DIRECTORY': Path(),
     'DISCORD_INVITE_ID': None,
     'ENCOUNTER': None,
     'FAVOR_CAPTCHA': True,
@@ -170,7 +168,6 @@ _defaults = {
     'LOAD_CUSTOM_JS_FILE': False,
     'LOGIN_TIMEOUT': 2.5,
     'MANAGER_ADDRESS': None,
-    'MAP_FILTER_IDS': None,
     'MAP_PROVIDER_URL': '//{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
     'MAP_PROVIDER_ATTRIBUTION': '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
     'MAP_WORKERS': True,
@@ -195,7 +192,6 @@ _defaults = {
     'REFRESH_RATE': 0.6,
     'REPORT_MAPS': True,
     'REPORT_SINCE': None,
-    'RESCAN_UNKNOWN': 90,
     'SCAN_DELAY': 10,
     'SEARCH_SLEEP': 2.5,
     'SHOW_TIMER': False,
@@ -218,7 +214,6 @@ _defaults = {
     'TRASH_IDS': (),
     'TWEET_IMAGES': False,
     'TWITTER_ACCESS_KEY': None,
-    'TWITTER_ACCESS_SECRET': None,
     'TWITTER_CONSUMER_KEY': None,
     'TWITTER_CONSUMER_SECRET': None,
     'TWITTER_SCREEN_NAME': None,
@@ -240,8 +235,8 @@ class Config:
                 elif key in _defaults and value is _defaults[key]:
                     setattr(self, key, _defaults.pop(key))
                 else:
-                    valid = _valid_types[key]
-                    actual = type(value).__name__
+                    valid = isinstance(_valid_types[key], type)
+                    actual = type(value).__name
                     if isinstance(valid, type):
                         err = '{} must be {}. Yours is: {}.'.format(
                             key, valid.__name__, actual)
