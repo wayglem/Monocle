@@ -11,54 +11,68 @@ from aiopogo.auth_ptc import AuthPtc
 from aiopogo.hash_server import HashServer
 from pogeo import get_distance
 
-from .db import SIGHTING_CACHE, MYSTERY_CACHE, Bounds
+from .db import SIGHTING_CACHE, MYSTERY_CACHE
 from .utils import round_coords, load_pickle, get_device_info, get_spawn_id, get_start_coords, Units, randomize_point
 from .shared import get_logger, LOOP, SessionManager, run_threaded, ACCOUNTS
-from .spawns import SPAWNS
 from .db_proc import DB_PROC
-from . import avatar, sanitized as conf
+from . import avatar, bounds, spawns, sanitized as conf
 
 if conf.NOTIFY:
     from .notification import Notifier
 
 if conf.CACHE_CELLS:
-    from aiopogo.utilities import get_cell_ids
     from array import typecodes
+    if 'Q' in typecodes:
+        from aiopogo.utilities import get_cell_ids_compact as get_cell_ids
+    else:
+        from pogeo import get_cell_ids
 else:
     from pogeo import get_cell_ids
 
 _unit = getattr(Units, conf.SPEED_UNIT.lower())
-if _unit is Units.miles:
-    SPINNING_SPEED_LIMIT = 21
-    UNIT_STRING = "MPH"
-elif _unit is Units.kilometers:
-    SPINNING_SPEED_LIMIT = 34
-    UNIT_STRING = "KMH"
-elif _unit is Units.meters:
-    SPINNING_SPEED_LIMIT = 34000
-    UNIT_STRING = "m/h"
-_UNIT = _unit.value
-
-VERSIONS = ('0.57.4', '0.57.3', '0.57.2', '0.55.0')
+if conf.SPIN_POKESTOPS:
+    if _unit is Units.miles:
+        SPINNING_SPEED_LIMIT = 21
+        UNIT_STRING = "MPH"
+    elif _unit is Units.kilometers:
+        SPINNING_SPEED_LIMIT = 34
+        UNIT_STRING = "KMH"
+    elif _unit is Units.meters:
+        SPINNING_SPEED_LIMIT = 34000
+        UNIT_STRING = "m/h"
+UNIT = _unit.value
+del _unit
 
 
 class Worker:
     """Single worker walking on the map"""
 
+    if conf.FORCED_KILL:
+        versions = ('0.59.1', '0.57.4', '0.57.3', '0.57.2', '0.55.0')
     download_hash = "7b9c5056799a2c5c7d48a62c497736cbcf8c4acb"
+    scan_delay = conf.SCAN_DELAY if conf.SCAN_DELAY >= 10 else 10
     g = {'seen': 0, 'captchas': 0}
 
     if conf.CACHE_CELLS:
-        cell_ids = load_pickle('cells') or {}
-        COMPACT = 'Q' in typecodes
+        cells = load_pickle('cells') or {}
+        def cell_ids(self, lat, lon, radius):
+            rounded = round_coords((lat, lon), 4)
+            try:
+                return self.cells[rounded]
+            except KeyError:
+                cells = get_cell_ids(*rounded, radius)
+                self.cells[rounded] = cells
+                return cells
+    else:
+        cell_ids = get_cell_ids
 
     login_semaphore = Semaphore(conf.SIMULTANEOUS_LOGINS, loop=LOOP)
     sim_semaphore = Semaphore(conf.SIMULTANEOUS_SIMULATION, loop=LOOP)
 
-    MULTIPROXY = False
+    multiproxy = False
     if conf.PROXIES:
         if len(conf.PROXIES) > 1:
-            MULTIPROXY = True
+            multiproxy = True
         proxies = cycle(conf.PROXIES)
     else:
         proxies = None
@@ -166,7 +180,7 @@ class Worker:
             raise err
 
         self.error_code = '°'
-        version = 5704
+        version = 5901
         async with self.sim_semaphore:
             self.error_code = 'APP SIMULATION'
             if conf.APP_SIMULATION:
@@ -459,24 +473,24 @@ class Worker:
                 await self.login(reauth=True)
             except ex.TimeoutException as e:
                 self.error_code = 'TIMEOUT'
-                if err != e:
+                if not isinstance(e, type(err)):
                     err = e
                     self.log.warning('{}', e)
                 await sleep(10, loop=LOOP)
             except ex.HashingOfflineException as e:
-                if err != e:
+                if not isinstance(e, type(err)):
                     err = e
                     self.log.warning('{}', e)
                 self.error_code = 'HASHING OFFLINE'
                 await sleep(5, loop=LOOP)
             except ex.NianticOfflineException as e:
-                if err != e:
+                if not isinstance(e, type(err)):
                     err = e
                     self.log.warning('{}', e)
                 self.error_code = 'NIANTIC OFFLINE'
                 await self.random_sleep()
             except ex.HashingQuotaExceededException as e:
-                if err != e:
+                if not isinstance(e, type(err)):
                     err = e
                     self.log.warning('Exceeded your hashing quota, sleeping.')
                 self.error_code = 'QUOTA EXCEEDED'
@@ -493,26 +507,26 @@ class Worker:
                 raise
             except ex.InvalidRPCException as e:
                 self.last_request = time()
-                if err != e:
+                if not isinstance(e, type(err)):
                     err = e
                     self.log.warning('{}', e)
                 self.error_code = 'INVALID REQUEST'
                 await self.random_sleep()
             except ex.ProxyException as e:
-                if err != e:
+                if not isinstance(e, type(err)):
                     err = e
                 self.error_code = 'PROXY ERROR'
 
-                if self.MULTIPROXY:
+                if self.multiproxy:
                     self.log.error('{}, swapping proxy.', e)
                     self.swap_proxy()
                 else:
-                    if err != e:
+                    if not isinstance(e, type(err)):
                         self.log.error('{}', e)
                     await sleep(5, loop=LOOP)
             except (ex.MalformedResponseException, ex.UnexpectedResponseException) as e:
                 self.last_request = time()
-                if err != e:
+                if not isinstance(e, type(err)):
                     self.log.warning('{}', e)
                 self.error_code = 'MALFORMED RESPONSE'
                 await self.random_sleep()
@@ -543,7 +557,7 @@ class Worker:
                 try:
                     if (not dl_hash
                             and conf.FORCED_KILL
-                            and dl_settings['settings']['minimum_client_version'] not in VERSIONS):
+                            and dl_settings['settings']['minimum_client_version'] not in self.versions):
                         err = 'A new version is being forced, exiting.'
                         self.log.error(err)
                         print(err)
@@ -558,8 +572,8 @@ class Worker:
 
     def travel_speed(self, point):
         '''Fast calculation of travel speed to point'''
-        time_diff = max(time() - self.last_request, conf.SCAN_DELAY)
-        distance = get_distance(self.location, point, _UNIT)
+        time_diff = max(time() - self.last_request, self.scan_delay)
+        distance = get_distance(self.location, point, UNIT)
         # conversion from seconds to hours
         speed = (distance / time_diff) * 3600
         return speed
@@ -577,10 +591,8 @@ class Worker:
 
         Also is capable of restarting in case an error occurs.
         """
-        visited = False
         try:
-            self.altitude = SPAWNS.get_altitude(point)
-            self.altitude = uniform(self.altitude - 1, self.altitude + 1)
+            self.altitude = spawns.get_altitude(point, randomize=5)
             self.location = point
             self.api.set_position(*self.location, self.altitude)
             if not self.authenticated:
@@ -618,7 +630,7 @@ class Worker:
         except ex.ProxyException as e:
             self.error_code = 'PROXY ERROR'
 
-            if self.MULTIPROXY:
+            if self.multiproxy:
                 self.log.error('{} Swapping proxy.', e)
                 self.swap_proxy()
             else:
@@ -628,11 +640,14 @@ class Worker:
         except ex.NianticIPBannedException:
             self.error_code = 'IP BANNED'
 
-            if self.MULTIPROXY:
+            if self.multiproxy:
                 self.log.warning('Swapping out {} due to IP ban.', self.api.proxy)
                 self.swap_proxy()
             else:
                 self.log.error('IP banned.')
+        except ex.NianticOfflineException as e:
+            await self.swap_account(reason='Niantic endpoint failure')
+            self.log.warning('{}. Giving up.', e)
         except ex.ServerBusyOrOfflineException as e:
             self.log.warning('{} Giving up.', e)
         except ex.BadRPCException:
@@ -641,9 +656,9 @@ class Worker:
             await self.new_account()
         except ex.InvalidRPCException as e:
             self.log.warning('{} Giving up.', e)
-        except ex.ExpiredHashKeyException:
+        except ex.ExpiredHashKeyException as e:
             self.error_code = 'KEY EXPIRED'
-            err = 'Hash key has expired: {}'.format(conf.HASH_KEY)
+            err = str(e)
             self.log.error(err)
             print(err)
             exit()
@@ -668,33 +683,21 @@ class Worker:
 
     async def visit_point(self, point, bootstrap=False):
         self.handle.cancel()
-        if bootstrap:
-            self.error_code = '∞'
-        else:
-            self.error_code = '!'
+        self.error_code = '∞' if bootstrap else '!'
+
         latitude, longitude = point
         self.log.info('Visiting {0[0]:.4f},{0[1]:.4f}', point)
         start = time()
 
-        if conf.CACHE_CELLS:
-            rounded = round_coords(point, 4)
-            try:
-                cell_ids = self.cell_ids[rounded]
-            except KeyError:
-                cell_ids = get_cell_ids(*rounded, compact=self.COMPACT)
-                self.cell_ids[rounded] = cell_ids
-        else:
-            cell_ids = get_cell_ids(latitude, longitude, 500)
-
+        cell_ids = self.cell_ids(latitude, longitude, 500)
         since_timestamp_ms = (0,) * len(cell_ids)
-
         request = self.api.create_request()
         request.get_map_objects(cell_id=cell_ids,
                                 since_timestamp_ms=since_timestamp_ms,
                                 latitude=latitude,
                                 longitude=longitude)
 
-        diff = self.last_gmo + conf.SCAN_DELAY - time()
+        diff = self.last_gmo + self.scan_delay - time()
         if diff > 0:
             await sleep(diff, loop=LOOP)
         responses = await self.call(request)
@@ -720,12 +723,11 @@ class Worker:
         forts_seen = 0
         points_seen = 0
 
-        if conf.NOTIFY:
-            try:
-                time_of_day = map_objects['time_of_day']
-            except KeyError:
-                self.empty_visits += 1
-                raise EmptyGMOException
+        try:
+            time_of_day = map_objects['time_of_day']
+        except KeyError:
+            self.empty_visits += 1
+            raise EmptyGMOException
 
         if conf.ITEM_LIMITS and self.bag_full():
             await self.clean_bag()
@@ -740,7 +742,7 @@ class Worker:
                 if conf.NOTIFY and self.notifier.eligible(normalized):
                     if conf.ENCOUNTER:
                         try:
-                            await self.encounter(normalized)
+                            await self.encounter(normalized, pokemon['spawn_point_id'])
                         except CancelledError:
                             DB_PROC.add(normalized)
                             raise
@@ -754,7 +756,7 @@ class Worker:
                     if (conf.ENCOUNTER == 'all' and
                             'individual_attack' not in normalized):
                         try:
-                            await self.encounter(normalized)
+                            await self.encounter(normalized, pokemon['spawn_point_id'])
                         except Exception as e:
                             self.log.warning('{} during encounter', e.__class__.__name__)
                 DB_PROC.add(normalized)
@@ -782,17 +784,16 @@ class Worker:
                 else:
                     DB_PROC.add(self.normalize_gym(fort))
 
-            if conf.MORE_POINTS or bootstrap:
-                for point in map_cell.get('spawn_points', []):
-                    points_seen += 1
-                    try:
-                        p = (point['latitude'], point['longitude'])
-                        if SPAWNS.have_point(p) or not Bounds.contain(p):
+            if conf.MORE_POINTS:
+                try:
+                    for point in map_cell['spawn_points']:
+                        points_seen += 1
+                        p = point['latitude'], point['longitude']
+                        if spawns.have_point(p) or p not in bounds:
                             continue
-                        SPAWNS.add_cell_point(p)
-                    except (KeyError, TypeError):
-                        self.log.warning('Spawn point exception ignored. {}', point)
-                        pass
+                        spawns.cell_points.add(p)
+                except KeyError:
+                    pass
 
         if (conf.INCUBATE_EGGS and self.unused_incubators
                 and self.eggs and self.smart_throttle()):
@@ -810,7 +811,7 @@ class Worker:
                 self.error_code = '0 SEEN'
             else:
                 self.error_code = ','
-            if self.empty_visits > 3:
+            if self.empty_visits > 3 and not bootstrap:
                 reason = '{} empty visits'.format(self.empty_visits)
                 await self.swap_account(reason)
         self.visits += 1
@@ -896,7 +897,7 @@ class Worker:
         self.error_code = '!'
         return responses
 
-    async def encounter(self, pokemon):
+    async def encounter(self, pokemon, spawn_id):
         distance_to_pokemon = get_distance(self.location, (pokemon['lat'], pokemon['lon']))
 
         self.error_code = '~'
@@ -907,24 +908,15 @@ class Worker:
             lon_change = (self.location[1] - pokemon['lon']) * percent
             self.location = (
                 self.location[0] - lat_change,
-                self.location[1] - lon_change,
-            )
-            self.altitude = uniform(self.altitude - 3, self.altitude + 3)
+                self.location[1] - lon_change)
+            self.altitude = uniform(self.altitude - 2, self.altitude + 2)
             self.api.set_position(*self.location, self.altitude)
-            delay_required = (distance_to_pokemon * percent) / 8
-            if delay_required < 1.5:
-                delay_required = triangular(1.5, 4, 2.25)
+            delay_required = min((distance_to_pokemon * percent) / 8, 1.1)
         else:
             self.simulate_jitter()
-            delay_required = triangular(1.5, 4, 2.25)
+            delay_required = 1.1
 
-        if time() - self.last_request < delay_required:
-            await sleep(delay_required, loop=LOOP)
-
-        try:
-            spawn_id = hex(pokemon['spawn_id'])[2:]
-        except TypeError:
-            spawn_id = pokemon['spawn_id']
+        await self.random_sleep(delay_required, delay_required + 1.5)
 
         request = self.api.create_request()
         request = request.encounter(encounter_id=pokemon['encounter_id'],
@@ -941,6 +933,9 @@ class Worker:
             pokemon['individual_attack'] = pdata.get('individual_attack', 0)
             pokemon['individual_defense'] = pdata.get('individual_defense', 0)
             pokemon['individual_stamina'] = pdata.get('individual_stamina', 0)
+            pokemon['height'] = pdata['height_m']
+            pokemon['weight'] = pdata['weight_kg']
+            pokemon['gender'] = pdata['pokemon_display']['gender']
         except KeyError:
             self.log.error('Missing Pokemon data in encounter response.')
         self.error_code = '!'
@@ -1177,7 +1172,7 @@ class Worker:
             norm['time_till_hidden'] = tth / 1000
             norm['inferred'] = False
         else:
-            despawn = SPAWNS.get_despawn_time(norm['spawn_id'], tss)
+            despawn = spawns.get_despawn_time(norm['spawn_id'], tss)
             if despawn:
                 norm['expire_timestamp'] = despawn
                 norm['time_till_hidden'] = despawn - tss
@@ -1237,9 +1232,9 @@ class Worker:
             return False
 
     @staticmethod
-    async def random_sleep(minimum=10.1, maximum=14):
+    async def random_sleep(minimum=10.1, maximum=14, loop=LOOP):
         """Sleeps for a bit"""
-        await sleep(uniform(minimum, maximum), loop=LOOP)
+        await sleep(uniform(minimum, maximum), loop=loop)
 
     @property
     def start_time(self):

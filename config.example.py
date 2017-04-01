@@ -5,7 +5,7 @@ DB_ENGINE = 'sqlite:///db.sqlite'
 #DB_ENGINE = 'postgresql://user:pass@localhost/monocle
 
 AREA_NAME = 'SLC'     # the city or region you are scanning
-LANGUAGE = 'EN'       # ISO 639-1 codes EN, DE, FR, and ZH for Pokémon names.
+LANGUAGE = 'EN'       # ISO 639-1 codes EN, DE, ES, FR, IT, JA, KO, or ZH for Pokémon/move names
 MAX_CAPTCHAS = 100    # stop launching new visits if this many CAPTCHAs are pending
 SCAN_DELAY = 10       # wait at least this many seconds before scanning with the same account
 SPEED_UNIT = 'miles'  # valid options are 'miles', 'kilometers', 'meters'
@@ -28,7 +28,8 @@ MAP_END = (40.7143, -111.8046)
 STAY_WITHIN_MAP = True
 
 # ensure that you visit within this many meters of every part of your map during bootstrap
-#BOOTSTRAP_RADIUS = 240
+# lower values are more thorough but will take longer
+BOOTSTRAP_RADIUS = 120
 
 GIVE_UP_KNOWN = 75   # try to find a worker for a known spawn for this many seconds before giving up
 GIVE_UP_UNKNOWN = 60 # try to find a worker for an unknown point for this many seconds before giving up
@@ -57,7 +58,7 @@ SIMULTANEOUS_SIMULATION = 10
 # Immediately select workers whose speed are below (SPEED_UNIT)p/h instead of
 # continuing to try to find the worker with the lowest speed.
 # May increase clustering if you have a high density of workers.
-#GOOD_ENOUGH = 4
+GOOD_ENOUGH = 0.1
 
 # Seconds to sleep after failing to find an eligible worker before trying again.
 SEARCH_SLEEP = 2.5
@@ -99,7 +100,7 @@ INCUBATE_EGGS = False        # incubate eggs if available
 ENCOUNTER = None
 
 # PokéStops
-SPIN_POKESTOPS = False # spin all PokéStops that are within range
+SPIN_POKESTOPS = True  # spin all PokéStops that are within range
 SPIN_COOLDOWN = 300    # spin only one PokéStop every n seconds (default 300)
 
 # minimum number of each item to keep if the bag is cleaned
@@ -124,7 +125,7 @@ ITEM_LIMITS = {
 '''
 
 # Update the console output every x seconds
-REFRESH_RATE = 0.6  # 600ms
+REFRESH_RATE = 0.75  # 750ms
 # Update the seen/speed/visit/speed stats every x seconds
 STAT_REFRESH = 5
 
@@ -138,8 +139,7 @@ MAX_RETRIES = 3
 LOGIN_TIMEOUT = 2.5
 
 # add spawn points reported in cell_ids to the unknown spawns list
-# disable if your workers already have more than enough points to visit
-MORE_POINTS = True
+#MORE_POINTS = False
 
 # Set to True to kill the scanner when a newer version is forced
 #FORCED_KILL = False
@@ -159,13 +159,18 @@ from datetime import datetime
 REPORT_SINCE = datetime(2017, 2, 17)  # base reports on data from after this date
 
 # used for altitude queries and maps in reports
-GOOGLE_MAPS_KEY = 'OYOgW1wryrp2RKJ81u7BLvHfYUA6aArIyuQCXu4'  # this key is fake
-#ALT_RANGE = (1250, 1450)  # Fall back to altitudes in this range if Google query fails
+#GOOGLE_MAPS_KEY = 'OYOgW1wryrp2RKJ81u7BLvHfYUA6aArIyuQCXu4'  # this key is fake
 REPORT_MAPS = True  # Show maps on reports
+#ALT_RANGE = (1250, 1450)  # Fall back to altitudes in this range if Google query fails
+
+## Round altitude coordinates to this many decimal places
+## More precision will lead to larger caches and more Google API calls
+## Maximum distance from coords to rounded coords for precisions (at Lat40):
+## 1: 7KM, 2: 700M, 3: 70M, 4: 7M
+#ALT_PRECISION = 2
 
 ## Automatically resolve captchas using 2Captcha key.
 #CAPTCHA_KEY = '1abc234de56fab7c89012d34e56fa7b8'
-
 ## the number of CAPTCHAs an account is allowed to receive before being swapped out
 #CAPTCHAS_ALLOWED = 3
 ## Get new accounts from the CAPTCHA queue first if it's not empty
@@ -200,7 +205,7 @@ LAST_MIGRATION = 1481932800  # Dec. 17th, 2016
 #MANAGER_ADDRESS = ('127.0.0.1', 5002)  # could be used for CAPTCHA solving and live worker maps on remote systems
 
 # Store the cell IDs so that they don't have to be recalculated every visit.
-# Enabling will increase memory usage.
+# Enabling will (potentially drastically) increase memory usage.
 #CACHE_CELLS = False
 
 # Only for use with web-sanic (requires PostgreSQL)

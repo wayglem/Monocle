@@ -1,10 +1,10 @@
 import random
 import requests
-import polyline
 import time
 import socket
 import pickle
 
+from polyline import encode as polyencode
 from os import mkdir
 from os.path import join, exists
 from sys import platform
@@ -26,7 +26,7 @@ except ImportError:
     def jit(func):
         return func
 
-from . import sanitized as conf
+from . import bounds, sanitized as conf
 
 IPHONES = {'iPhone5,1': 'N41AP',
            'iPhone5,2': 'N42AP',
@@ -44,14 +44,6 @@ IPHONES = {'iPhone5,1': 'N41AP',
            'iPhone9,3': 'D101AP',
            'iPhone9,4': 'D111AP'}
 
-if conf.BOUNDARIES:
-    MAP_CENTER = conf.BOUNDARIES.centroid.coords[0]
-    LAT_MEAN, LON_MEAN = MAP_CENTER
-else:
-    LAT_MEAN = (conf.MAP_END[0] + conf.MAP_START[0]) / 2
-    LON_MEAN = (conf.MAP_END[1] + conf.MAP_START[1]) / 2
-    MAP_CENTER = LAT_MEAN, LON_MEAN
-
 
 log = getLogger(__name__)
 
@@ -62,27 +54,32 @@ class Units(Enum):
     meters = 3
 
 
-def get_scan_area():
-    """Returns the square kilometers for configured scan area"""
-    width = get_distance(conf.MAP_START, (conf.MAP_START[0], conf.MAP_END[1]), Units.kilometers.value)
-    height = get_distance(conf.MAP_START, (conf.MAP_END[0], conf.MAP_START[1]), Units.kilometers.value)
-    area = round(width * height)
-    return area
+def best_factors(n):
+    return next(((i, n//i) for i in range(int(n**0.5), 0, -1) if n % i == 0))
 
 
-@jit
-def get_start_coords(worker_no):
+def percentage_split(seq, percentages):
+    percentages[-1] += 1.0 - sum(percentages)
+    prv = 0
+    size = len(seq)
+    cum_percentage = 0
+    for p in percentages:
+        cum_percentage += p
+        nxt = int(cum_percentage * size)
+        yield seq[prv:nxt]
+        prv = nxt
+
+
+def get_start_coords(worker_no, grid=conf.GRID, bounds=bounds):
     """Returns center of square for given worker"""
-    grid = conf.GRID
-    total_workers = grid[0] * grid[1]
-    per_column = int(total_workers / grid[0])
+    per_column = int((grid[0] * grid[1]) / grid[0])
 
     column = worker_no % per_column
     row = int(worker_no / per_column)
-    part_lat = (conf.MAP_END[0] - conf.MAP_START[0]) / grid[0]
-    part_lon = (conf.MAP_END[1] - conf.MAP_START[1]) / grid[1]
-    start_lat = conf.MAP_START[0] + part_lat * row + part_lat / 2
-    start_lon = conf.MAP_START[1] + part_lon * column + part_lon / 2
+    part_lat = (bounds.south - bounds.north) / grid[0]
+    part_lon = (bounds.east - bounds.west) / grid[1]
+    start_lat = bounds.north + part_lat * row + part_lat / 2
+    start_lon = bounds.west + part_lon * column + part_lon / 2
     return start_lat, start_lon
 
 
@@ -103,7 +100,7 @@ def get_gains(dist=70):
 
     Gain is space between circles.
     """
-    start = Point(*MAP_CENTER)
+    start = Point(*bounds.center)
     base = dist * sqrt(3)
     height = base * sqrt(3) / 2
     dis_a = distance(meters=base)
@@ -125,76 +122,81 @@ def random_altitude():
 
 
 def get_altitude(point):
-    params = {'locations': 'enc:' + polyline.encode((point,))}
-    if conf.GOOGLE_MAPS_KEY:
-        params['key'] = conf.GOOGLE_MAPS_KEY
+    params = {
+        'locations': 'enc:' + polyencode((point,)),
+        'key': conf.GOOGLE_MAPS_KEY
+    }
     r = requests.get('https://maps.googleapis.com/maps/api/elevation/json',
                      params=params).json()
-    altitude = r['results'][0]['elevation']
-    return altitude
+    return r['results'][0]['elevation']
 
 
-def get_altitudes(coords, precision=3):
+def get_altitudes(coords):
     def chunks(l, n):
         """Yield successive n-sized chunks from l."""
         for i in range(0, len(l), n):
             yield l[i:i + n]
 
-    altitudes = dict()
     if len(coords) > 300:
-        for chunk in tuple(chunks(coords, 300)):
-            altitudes.update(get_altitudes(chunk, precision))
+        altitudes = {}
+        for chunk in chunks(coords, 300):
+            altitudes.update(get_altitudes(chunk))
+        return altitudes
     else:
         try:
-            params = {'locations': 'enc:' + polyline.encode(coords)}
+            params = {'locations': 'enc:' + polyencode(coords)}
             if conf.GOOGLE_MAPS_KEY:
                 params['key'] = conf.GOOGLE_MAPS_KEY
             r = requests.get('https://maps.googleapis.com/maps/api/elevation/json',
                              params=params).json()
 
-            for result in r['results']:
-                point = (result['location']['lat'], result['location']['lng'])
-                key = round_coords(point, precision)
-                altitudes[key] = result['elevation']
+            return {round_coords((x['location']['lat'], x['location']['lng']), conf.ALT_PRECISION):
+                    x['elevation'] for x in r['results']}
         except Exception:
             log.exception('Error fetching altitudes.')
-    return altitudes
+            return {}
 
 
-def get_point_altitudes(precision=3):
-    rounded_coords = set()
-    lat_gain, lon_gain = get_gains(100)
-    for map_row, lat in enumerate(
-        float_range(conf.MAP_START[0], conf.MAP_END[0], lat_gain)
-    ):
-        row_start_lon = conf.MAP_START[1]
-        odd = map_row % 2 != 0
-        if odd:
-            row_start_lon -= 0.5 * lon_gain
-        for map_col, lon in enumerate(
-            float_range(row_start_lon, conf.MAP_END[1], lon_gain)
-        ):
-            key = round_coords((lat, lon), precision)
-            rounded_coords.add(key)
-    rounded_coords = tuple(rounded_coords)
-    altitudes = get_altitudes(rounded_coords, precision)
-    return altitudes
-
-
-def get_bootstrap_points():
-    lat_gain, lon_gain = get_gains(conf.BOOTSTRAP_RADIUS)
+def get_altitude_coords(bounds):
     coords = []
+    if bounds.multi:
+        for b in bounds.polygons:
+            coords.extend(get_altitude_coords(b))
+        return coords
+    precision = conf.ALT_PRECISION
+    gain = 1 / (10 ** precision)
+    west, east = bounds.west, bounds.east
+    bound = bool(bounds)
+    for lat in float_range(bounds.south, bounds.north, gain):
+        for lon in float_range(west, east, gain):
+            point = lat, lon
+            coords.append(round_coords(point, precision))
+    return coords
+
+
+def get_all_altitudes():
+    return get_altitudes(get_altitude_coords(bounds))
+
+
+def get_bootstrap_points(bounds):
+    coords = []
+    if bounds.multi:
+        for b in bounds.polygons:
+            coords.extend(get_bootstrap_points(b))
+        return coords
+    lat_gain, lon_gain = get_gains(conf.BOOTSTRAP_RADIUS)
+    west, east = bounds.west, bounds.east
+    bound = bool(bounds)
     for map_row, lat in enumerate(
-        float_range(conf.MAP_START[0], conf.MAP_END[0], lat_gain)
+        float_range(bounds.south, bounds.north, lat_gain)
     ):
-        row_start_lon = conf.MAP_START[1]
-        odd = map_row % 2 != 0
-        if odd:
+        row_start_lon = west
+        if map_row % 2 != 0:
             row_start_lon -= 0.5 * lon_gain
-        for map_col, lon in enumerate(
-            float_range(row_start_lon, conf.MAP_END[1], lon_gain)
-        ):
-            coords.append([lat,lon])
+        for lon in float_range(row_start_lon, east, lon_gain):
+            point = lat, lon
+            if not bound or point in bounds:
+                coords.append(point)
     random.shuffle(coords)
     return coords
 
@@ -338,13 +340,16 @@ def get_address():
     return ('127.0.0.1', 5001)
 
 
-def load_pickle(name):
+def load_pickle(name, raise_exception=False):
     location = join(conf.DIRECTORY, 'pickles', '{}.pickle'.format(name))
     try:
         with open(location, 'rb') as f:
             return pickle.load(f)
     except (FileNotFoundError, EOFError):
-        return None
+        if raise_exception:
+            raise FileNotFoundError
+        else:
+            return None
 
 
 def dump_pickle(name, var):

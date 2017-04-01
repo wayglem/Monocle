@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from datetime import datetime, timedelta
 from pkg_resources import resource_filename
 
@@ -6,9 +8,10 @@ import argparse
 
 from flask import Flask, render_template
 
-from monocle import db, utils, sanitized as conf
-from monocle.names import POKEMON_NAMES
+from monocle import db, sanitized as conf
+from monocle.names import POKEMON
 from monocle.web_utils import get_args
+from monocle.bounds import area
 
 
 app = Flask(__name__, template_folder=resource_filename('monocle', 'templates'))
@@ -37,6 +40,7 @@ def get_stats():
     prestige_percent = {}
     total_prestige = 0
     last_date = 0
+    pokemon_names = POKEMON
     for fort in forts:
         if fort['last_modified'] > last_date:
             last_date = fort['last_modified']
@@ -55,7 +59,7 @@ def get_stats():
                 strongest[team] = (
                     fort['prestige'],
                     pokemon_id,
-                    POKEMON_NAMES[pokemon_id],
+                    pokemon_names[pokemon_id],
                 )
             # Guardians
             guardian_value = guardians[team].get(pokemon_id, 0)
@@ -76,7 +80,7 @@ def get_stats():
                 key=guardians[team.value].__getitem__,
                 reverse=True
             )[0]
-            top_guardians[team.value] = POKEMON_NAMES[pokemon_id]
+            top_guardians[team.value] = pokemon_names[pokemon_id]
     CACHE['generated_at'] = datetime.now()
     CACHE['data'] = {
         'order': sorted(count, key=count.__getitem__, reverse=True),
@@ -101,7 +105,7 @@ def index():
     return render_template(
         'gyms.html',
         area_name=conf.AREA_NAME,
-        area_size=utils.get_scan_area(),
+        area_size=area,
         minutes_ago=int((datetime.now() - stats['generated_at']).seconds / 60),
         last_date_minutes_ago=int((time.time() - stats['last_date']) / 60),
         team_names=team_names,
