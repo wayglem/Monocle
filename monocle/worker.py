@@ -5,8 +5,9 @@ from queue import Empty
 from itertools import cycle
 from sys import exit
 from concurrent.futures import CancelledError
+from distutils.version import StrictVersion
 
-from aiopogo import PGoApi, exceptions as ex
+from aiopogo import PGoApi, json_loads, exceptions as ex
 from aiopogo.auth_ptc import AuthPtc
 from aiopogo.hash_server import HashServer
 from pogeo import get_distance
@@ -47,8 +48,6 @@ del _unit
 class Worker:
     """Single worker walking on the map"""
 
-    if conf.FORCED_KILL:
-        versions = ('0.59.1', '0.57.4', '0.57.3', '0.57.2', '0.55.0')
     download_hash = "7b9c5056799a2c5c7d48a62c497736cbcf8c4acb"
     scan_delay = conf.SCAN_DELAY if conf.SCAN_DELAY >= 10 else 10
     g = {'seen': 0, 'captchas': 0}
@@ -126,27 +125,25 @@ class Worker:
     def initialize_api(self):
         device_info = get_device_info(self.account)
         self.empty_visits = 0
-        self.account_seen = 0
 
         self.api = PGoApi(device_info=device_info)
         self.api.set_position(*self.location, self.altitude)
         if self.proxies:
-            self.api.set_proxy(next(self.proxies))
+            self.api.proxy = next(self.proxies)
         try:
             if self.account['provider'] == 'ptc' and 'auth' in self.account:
-                self.api._auth_provider = AuthPtc(username=self.username, password=self.account['password'], timeout=conf.LOGIN_TIMEOUT)
-                self.api._auth_provider._access_token = self.account['auth']
-                self.api._auth_provider.set_refresh_token(self.account['refresh'])
-                self.api._auth_provider._access_token_expiry = self.account['expiry']
-                if self.api._auth_provider.check_access_token():
-                    self.api._auth_provider._login = True
+                self.api.auth_provider = AuthPtc(username=self.username, password=self.account['password'], timeout=conf.LOGIN_TIMEOUT)
+                self.api.auth_provider._access_token = self.account['auth']
+                self.api.auth_provider._access_token_expiry = self.account['expiry']
+                if self.api.auth_provider.check_access_token():
+                    self.api.auth_provider.authenticated = True
         except KeyError:
             pass
 
     def swap_proxy(self):
         proxy = self.api.proxy
         while proxy == self.api.proxy:
-            self.api.set_proxy(next(self.proxies))
+            self.api.proxy = next(self.proxies)
 
     async def login(self, reauth=False):
         """Logs worker in and prepares for scanning"""
@@ -163,7 +160,7 @@ class Worker:
                         provider=self.account.get('provider') or 'ptc',
                         timeout=conf.LOGIN_TIMEOUT
                     )
-            except (ex.AuthTimeoutException, ex.AuthConnectionException) as e:
+            except ex.AuthException as e:
                 err = e
                 await sleep(2, loop=LOOP)
             else:
@@ -180,7 +177,7 @@ class Worker:
             raise err
 
         self.error_code = '°'
-        version = 5901
+        version = 6100
         async with self.sim_semaphore:
             self.error_code = 'APP SIMULATION'
             if conf.APP_SIMULATION:
@@ -205,7 +202,7 @@ class Worker:
                 raise ex.BannedAccountException
 
             player_data = get_player['player_data']
-            tutorial_state = player_data.get('tutorial_state', [])
+            tutorial_state = player_data.get('tutorial_state', ())
             self.item_capacity = player_data['max_item_storage']
             if 'created' not in self.account:
                 self.account['created'] = player_data['creation_timestamp_ms'] / 1000
@@ -218,9 +215,9 @@ class Worker:
         request.download_remote_config_version(platform=1, app_version=version)
         responses = await self.call(request, stamp=False, buddy=False, settings=True, dl_hash=False)
 
-        inventory_items = responses.get('GET_INVENTORY', {}).get('inventory_delta', {}).get('inventory_items', [])
+        inventory_items = responses.get('GET_INVENTORY', {}).get('inventory_delta', {}).get('inventory_items', ())
         for item in inventory_items:
-            player_stats = item.get('inventory_item_data', {}).get('player_stats', {})
+            player_stats = item.get('inventory_item_data', {}).get('player_stats')
             if player_stats:
                 self.player_level = player_stats.get('level') or self.player_level
                 break
@@ -557,11 +554,13 @@ class Worker:
                 try:
                     if (not dl_hash
                             and conf.FORCED_KILL
-                            and dl_settings['settings']['minimum_client_version'] not in self.versions):
-                        err = 'A new version is being forced, exiting.'
-                        self.log.error(err)
-                        print(err)
-                        exit()
+                            and dl_settings['settings']['minimum_client_version'] != '0.61.0'):
+                        forced_version = StrictVersion(dl_settings['settings']['minimum_client_version'])
+                        if forced_version > StrictVersion('0.61.0'):
+                            err = '{} is being forced, exiting.'.format(forced_version)
+                            self.log.error(err)
+                            print(err)
+                            exit()
                 except KeyError:
                     pass
         if self.check_captcha(responses):
@@ -732,15 +731,31 @@ class Worker:
         if conf.ITEM_LIMITS and self.bag_full():
             await self.clean_bag()
 
+        encounter_conf = conf.ENCOUNTER
+        notify_conf = conf.NOTIFY
+        more_points = conf.MORE_POINTS
         for map_cell in map_objects['map_cells']:
             request_time_ms = map_cell['current_timestamp_ms']
-            for pokemon in map_cell.get('wild_pokemons', []):
+            for pokemon in map_cell.get('wild_pokemons', ()):
                 pokemon_seen += 1
 
                 normalized = self.normalize_pokemon(pokemon)
 
-                if conf.NOTIFY and self.notifier.eligible(normalized):
-                    if conf.ENCOUNTER:
+                if (normalized not in SIGHTING_CACHE and
+                        normalized not in MYSTERY_CACHE):
+                    if (encounter_conf == 'all'
+                            or (encounter_conf == 'some'
+                            and normalized['pokemon_id'] in conf.ENCOUNTER_IDS)):
+                        try:
+                            await self.encounter(normalized, pokemon['spawn_point_id'])
+                        except CancelledError:
+                            DB_PROC.add(normalized)
+                            raise
+                        except Exception as e:
+                            self.log.warning('{} during encounter', e.__class__.__name__)
+
+                if notify_conf and self.notifier.eligible(normalized):
+                    if encounter_conf and 'move1' not in normalized:
                         try:
                             await self.encounter(normalized, pokemon['spawn_point_id'])
                         except CancelledError:
@@ -749,20 +764,9 @@ class Worker:
                         except Exception as e:
                             self.log.warning('{} during encounter', e.__class__.__name__)
                     LOOP.create_task(self.notifier.notify(normalized, time_of_day))
-
-                if (normalized not in SIGHTING_CACHE and
-                        normalized not in MYSTERY_CACHE):
-                    self.account_seen += 1
-                    if (conf.ENCOUNTER == 'all' and
-                            'individual_attack' not in normalized):
-                        try:
-                            await self.encounter(normalized, pokemon['spawn_point_id'])
-                        except Exception as e:
-                            self.log.warning('{} during encounter', e.__class__.__name__)
                 DB_PROC.add(normalized)
 
-            spinning = None
-            for fort in map_cell.get('forts', []):
+            for fort in map_cell.get('forts', ()):
                 if not fort.get('enabled'):
                     continue
                 forts_seen += 1
@@ -771,20 +775,20 @@ class Worker:
                         norm = self.normalize_lured(fort, request_time_ms)
                         pokemon_seen += 1
                         if norm not in SIGHTING_CACHE:
-                            self.account_seen += 1
                             DB_PROC.add(norm)
                     pokestop = self.normalize_pokestop(fort)
                     DB_PROC.add(pokestop)
                     if (self.pokestops and not self.bag_full()
-                            and time() > self.next_spin and self.smart_throttle(2)
-                            and (not spinning or spinning.done())):
+                            and time() > self.next_spin
+                            and (not conf.SMART_THROTTLE or
+                            self.smart_throttle(2))):
                         cooldown = fort.get('cooldown_complete_timestamp_ms')
                         if not cooldown or time() > cooldown / 1000:
-                            spinning = LOOP.create_task(self.spin_pokestop(pokestop))
+                            await self.spin_pokestop(pokestop)
                 else:
                     DB_PROC.add(self.normalize_gym(fort))
 
-            if conf.MORE_POINTS:
+            if more_points:
                 try:
                     for point in map_cell['spawn_points']:
                         points_seen += 1
@@ -826,17 +830,11 @@ class Worker:
             forts_seen,
         )
 
-        if spinning:
-            await spinning
-
         self.update_accounts_dict()
         self.handle = LOOP.call_later(60, self.unset_code)
         return pokemon_seen + forts_seen + points_seen
 
     def smart_throttle(self, requests=1):
-        if not conf.SMART_THROTTLE:
-            return True
-
         try:
             # https://en.wikipedia.org/wiki/Linear_equation#Two_variables
             # e.g. hashes_left > 2.25*seconds_left+7.5, spare = 0.05, max = 150
@@ -1009,7 +1007,7 @@ class Worker:
                 'json': 1
             }
             async with session.post('http://2captcha.com/in.php', params=params, timeout=10) as resp:
-                response = await resp.json()
+                response = await resp.json(loads=json_loads)
         except CancelledError:
             raise
         except Exception as e:
@@ -1036,7 +1034,7 @@ class Worker:
             }
             while True:
                 async with session.get("http://2captcha.com/res.php", params=params, timeout=20) as resp:
-                    response = await resp.json()
+                    response = await resp.json(loads=json_loads)
                 if response.get('request') != 'CAPCHA_NOT_READY':
                     break
                 await sleep(5, loop=LOOP)
@@ -1081,9 +1079,8 @@ class Worker:
             self.account['level'] = self.player_level
 
         try:
-            self.account['refresh'] = self.api._auth_provider._refresh_token
-            self.account['auth'] = self.api._auth_provider._access_token
-            self.account['expiry'] = self.api._auth_provider._access_token_expiry
+            self.account['auth'] = self.api.auth_provider._access_token
+            self.account['expiry'] = self.api.auth_provider._access_token_expiry
         except AttributeError:
             pass
 
@@ -1257,7 +1254,7 @@ class Worker:
     @property
     def authenticated(self):
         try:
-            return self.api._auth_provider.is_login()
+            return self.api.auth_provider.authenticated
         except AttributeError:
             return False
 
